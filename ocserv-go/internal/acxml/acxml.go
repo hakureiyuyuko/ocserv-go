@@ -195,3 +195,13 @@ func Failure(msg string) []byte {
 </form></auth>
 </config-auth>`)
 }
+
+// SuccessComplete 是「认证通过」的完整响应，与真 ocserv 字节一致：
+// type="complete"（不是 auth-reply）+ <version who="sg"> + <title>SSL VPN Service</title>。
+// 真 AnyConnect 客户端要求这个形态才会继续发起 CONNECT。
+func SuccessComplete() []byte {
+	return []byte(xmlHeader + "<config-auth client=\"vpn\" type=\"complete\">\n" +
+		"<version who=\"sg\">0.1(1)</version>\n" +
+		"<auth id=\"success\">\n" +
+		"<title>SSL VPN Service</title></auth></config-auth>\n")
+}

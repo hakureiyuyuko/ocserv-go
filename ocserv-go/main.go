@@ -9,6 +9,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -94,6 +95,7 @@ func withSession(ctx context.Context, c net.Conn) context.Context {
 
 type server struct {
 	users    *auth.Users
+	certHash string
 	pendMu   sync.Mutex
 	pend     map[string]pendEntry
 	pool     *ippool.Pool
@@ -137,6 +139,7 @@ type serverConfig struct {
 	Addr      string
 	DTLS      bool
 	DTLSPort  int
+	CertHash  string
 	Dial      usrnet.DialFunc
 }
 
@@ -157,6 +160,7 @@ func newServer(c serverConfig) (*server, error) {
 		dpd:      time.Duration(c.DPD) * time.Second,
 		dns:      c.DNS,
 		prefix:   ones,
+		certHash: c.CertHash,
 		serverIP: net.ParseIP(c.ServerIP),
 		domain:   c.Domain,
 		style:    c.Style,
@@ -229,6 +233,7 @@ func main() {
 		Addr:      *addr,
 		DTLS:      *dtlsOn && !*httpOnly,
 		DTLSPort:  *dtlsPort,
+		CertHash:  certHashHex,
 		Dial:      buildDialer(*socksAddr),
 	})
 	if err != nil {
@@ -241,6 +246,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("TLS 配置失败: %v", err)
 		}
+		s.certHash = certHashHex // webvpnc cookie 里的 &sh:（证书 SHA1）
 	}
 
 	// DTLS 监听（与 TCP 同端口，UDP）。
@@ -326,6 +332,11 @@ func buildDialer(socks string) usrnet.DialFunc {
 	}
 }
 
+// certHashHex 是服务器证书 DER 的 SHA1（大写 hex）。AnyConnect 客户端从
+// 成功响应的 webvpnc cookie 里读 &sh:<这个值> 来定位隧道/校验证书，
+// 缺了它客户端认证通过后不会继续发 CONNECT（表现为"未能建立连接"）。
+var certHashHex string
+
 func tlsConfig() (*tls.Config, error) {
 	var cert tls.Certificate
 	var err error
@@ -343,6 +354,10 @@ func tlsConfig() (*tls.Config, error) {
 		log.Printf("使用自签证书（CN=%s），客户端会提示不受信任", *domain)
 	default:
 		return nil, fmt.Errorf("需要 -cert/-key，或加 -self-signed 联调")
+	}
+	if len(cert.Certificate) > 0 {
+		sum := sha1.Sum(cert.Certificate[0])
+		certHashHex = strings.ToUpper(hex.EncodeToString(sum[:]))
 	}
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
@@ -788,14 +803,32 @@ func (s *server) handleAuth(w http.ResponseWriter, r *http.Request, body []byte)
 	s.tokensMu.Lock()
 	s.tokens[token] = user
 	s.tokensMu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "webvpn", Value: token, Path: "/", Secure: s.secure, HttpOnly: true})
 	if sess != nil {
 		sess.mu.Lock()
 		sess.authed = true
 		sess.mu.Unlock()
 	}
 	log.Printf("认证成功: %s", user)
-	writeXML(w, acxml.Success())
+	s.writeSuccess(w, tok, token)
+}
+
+// writeSuccess 按 ocserv 的字节回认证成功：
+//
+//	type="complete" + <version who="sg"> + <auth id="success"><title>SSL VPN Service</title>
+//	以及 webvpn / webvpncontext / webvpnc(bu:/&p:t&iu:1/&sh:<证书SHA1>) 三个 cookie。
+//
+// 真 AnyConnect 客户端靠 webvpnc 里的 &sh: 定位隧道并校验证书，
+// 缺了它认证通过后不会继续发 CONNECT。
+func (s *server) writeSuccess(w http.ResponseWriter, ctxTok, token string) {
+	body := acxml.SuccessComplete()
+	h := w.Header()
+	h.Set("Content-Type", "text/xml; charset=utf-8")
+	h.Set("X-Transcend-Version", "1")
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	http.SetCookie(w, &http.Cookie{Name: "webvpn", Value: token, Path: "/", Secure: s.secure, HttpOnly: true})
+	http.SetCookie(w, &http.Cookie{Name: "webvpnc", Value: "bu:/&p:t&iu:1/&sh:" + s.certHash, Path: "/", Secure: s.secure, HttpOnly: true})
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 
 // ---- 两步式认证的待定用户名（按 webvpncontext cookie 存，5 分钟过期）----
