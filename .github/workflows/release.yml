@@ -92,15 +92,18 @@ jobs:
           V='${{ steps.ver.outputs.version }}'
           mkdir -p dist/pkg
           for ARCH in amd64 arm64; do
-            D="dist/pkg/ocserv-go-${V}-linux-${ARCH}"
+            D="$GITHUB_WORKSPACE/dist/pkg/ocserv-go-${V}-linux-${ARCH}"
             mkdir -p "$D/bin"
             ( cd ocserv-go && GOOS=linux GOARCH="$ARCH" CGO_ENABLED=0 \
-                go build -trimpath -ldflags "-s -w" -o "../../$D/bin/ocserv-go" . )
+                go build -trimpath -ldflags "-s -w" -o "$D/bin/ocserv-go" . )
+            [ -s "$D/bin/ocserv-go" ] || { echo "构建产物缺失: $D/bin/ocserv-go"; exit 1; }
             cp ocserv-go/install.sh "$D/install.sh"
             chmod +x "$D/install.sh"
             cp LICENSE "$D/LICENSE"
             cp ocserv-go/README.md "$D/README.md" 2>/dev/null || cp README.md "$D/README.md"
             tar czf "dist/ocserv-go-${V}-linux-${ARCH}.tar.gz" -C dist/pkg "ocserv-go-${V}-linux-${ARCH}"
+            tar tzf "dist/ocserv-go-${V}-linux-${ARCH}.tar.gz" | grep -q "bin/ocserv-go" \
+              || { echo "包内没有 bin/ocserv-go"; exit 1; }
           done
           rm -rf dist/pkg
           ls -l dist
