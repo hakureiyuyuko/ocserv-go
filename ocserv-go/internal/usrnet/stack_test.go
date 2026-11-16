@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
 
@@ -96,9 +97,8 @@ func TestICMPEchoReply(t *testing.T) {
 		if ic.Ident() != 0x1234 || ic.Sequence() != 7 {
 			t.Fatalf("id/seq 未回显: %d/%d", ic.Ident(), ic.Sequence())
 		}
-		ic.SetChecksum(0)
-		if got, want := ic.Checksum(), header.ICMPv4(out[ip.HeaderLength():]).Checksum(); got != want {
-			t.Fatalf("ICMP 校验和无效")
+		if sum := checksum.Checksum(out[ip.HeaderLength():], 0); sum != 0xffff {
+			t.Fatalf("ICMP 校验和无效（全字之和=%#x，应为 0xffff）", sum)
 		}
 		if !bytes.Equal(out[28:], payload) {
 			t.Fatalf("负载未原样回显: %q", out[28:])

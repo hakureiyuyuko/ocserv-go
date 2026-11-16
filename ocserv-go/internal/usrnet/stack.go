@@ -18,6 +18,7 @@ import (
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
@@ -268,7 +269,9 @@ func (st *Stack) replyICMPEcho(b []byte) bool {
 	ic.SetType(header.ICMPv4EchoReply)
 	ic.SetCode(0)
 	ic.SetChecksum(0)
-	ic.SetChecksum(ic.Checksum())
+	// 注意：header.ICMPv4.Checksum() 只是「读」校验和字段，
+	// 计算要用 checksum.Checksum(整段 ICMP 报文, 0) 再取反。
+	ic.SetChecksum(^checksum.Checksum(out[ihl:], 0))
 
 	if debug {
 		dbg("ICMP echo 本地应答: %s -> %s len=%d", net.IP(out[12:16]), net.IP(out[16:20]), len(out))
