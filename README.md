@@ -1,441 +1,329 @@
-# ocserv-go 分支
+# ocserv-go
 
-> **这是 `ocserv-go` 分支**：用 Go 重写 ocserv 的 AnyConnect 数据面，走**用户态网络栈**（gVisor），
-> 目标是在**无特权的 LXC / Docker** 里跑 —— 不需要 `/dev/net/tun`、不需要 `NET_ADMIN`、
-> 不需要 `iptables` / `ip_forward`。
->
-> **生产部署请用 [`main`](https://github.com/hakureiyuyuko/ocserv-deploy-kit) 分支**。
-> 本分支是实验性的：只替换服务端数据面，管理面板 / 证书 / 部署脚本仍以 main 为准（下文原样保留作参考）。
+用 Go 重写的 **Cisco AnyConnect / ASA 兼容 VPN 服务端**：协议层照旧（客户端不用改），
+数据面换成 **gVisor 用户态 TCP/IP 栈** —— 所以**不需要 `/dev/net/tun`、不需要 `NET_ADMIN`、
+不需要 `iptables` / `ip_forward`**，无特权 LXC / Docker / PaaS 里都能跑。
 
-## 两个分支怎么选
+> 状态：**实验分支**（`ocserv-go`）。生产部署请用 [`main`](https://github.com/hakureiyuyuko/ocserv-deploy-kit) 分支的 C 版 ocserv。
 
-| | `main`（生产） | `ocserv-go`（本分支，实验） |
+---
+
+## 它解决什么问题
+
+传统 ocserv 依赖内核 TUN 设备把隧道里的 IP 包接进来，再靠 iptables 做 NAT 出网。这在
+受限容器里直接用不了：要么拿不到 `/dev/net/tun`，要么没有 `NET_ADMIN`。
+
+ocserv-go 把这两步都搬进进程：
+
+```
+AnyConnect 客户端
+   │  TLS（控制） + DTLS（数据，可选）
+   │  ASA 风格 webvpn 认证（HTML 表单 / XML）+ CSTP 帧
+   ▼
+ocserv-go
+   ├─ 认证：bcrypt 或 ocpasswd 的 $5$/$6$ crypt
+   ├─ CSTP：8 字节帧（"STF"+0x01 + 长度 + 类型）
+   ├─ DTLS：Cisco 的「预共享主密钥恢复握手」
+   └─ gVisor 用户态 TCP/IP 栈
+        ├─ 客户端发来的 IP 包注入栈
+        ├─ 栈里每条 TCP 连接 → 进程内 net.Dial 到真实目标 → 双向转发
+        └─ 每条 UDP 流同理（DNS/QUIC 可用）
+   ▼
+宿主网络（普通 socket 出网，无需任何特权）
+```
+
+每个客户端连接独享一个用户态栈，地址按连接从池里分配。
+
+## 和其它实现的关系
+
+| | 本分支 `ocserv-go` | `main` 分支 |
 |---|---|---|
-| 服务端实现 | C 版 ocserv（发行版包） | Go 重写，代码在 `ocserv-go/` |
-| 数据面 | 内核 TUN + `iptables MASQUERADE` | gVisor 用户态 TCP/IP 栈，进程内 socket 代理出网 |
-| 权限要求 | 需要 `/dev/net/tun` 与 `NET_ADMIN` | **不需要任何特权**（能监听端口即可） |
-| 适用环境 | 普通 VM / 有特权的容器 | 无特权 LXC、受限 Docker、PaaS |
-| 管理面板 | 有（配置向导 / 用户 / 证书 / 日志） | 暂无（命令行 + 用户文件） |
-| DTLS / IPv6 | 支持 | 暂无（仅 IPv4，TCP/UDP 代理） |
-| 稳定性 | 稳定 | 实验性 |
+| 服务端 | Go 重写（`ocserv-go/`） | C 版 ocserv（发行版包） |
+| 数据面 | gVisor 用户态栈，进程内出网 | 内核 TUN + iptables NAT |
+| 权限 | **无要求**（能监听端口即可） | 需要 tun / `NET_ADMIN` |
+| 面板 | 可切换后端（`backend=go`） | 原生后端 |
+| 协议 | AnyConnect / ASA（CSTP + DTLS） | 同（另有标准 OpenConnect 协议） |
 
-## 快速开始（本分支）
+---
+
+## 快速开始
+
+### 1. 编译
 
 ```bash
 cd ocserv-go
 go build -o bin/ocserv-go .
-./bin/ocserv-go hash '你的密码'        # 生成 bcrypt 行，写进 users.txt
-./bin/ocserv-go -addr :443 -users users.txt \
-  -cert fullchain.pem -key privkey.pem -dns 1.1.1.1
+# 纯 Go，可静态：CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o ocserv-go .
 ```
 
-Docker（注意：**没有** `--privileged` / `--device` / `--cap-add`）：
+### 2. 准备用户
+
+```bash
+./bin/ocserv-go hash '你的密码'          # 输出 $2a$… 一行
+echo 'alice:$2a$10$…' > users.txt
+```
+
+也**直接兼容 ocserv 的 `ocpasswd`**（`user:*:$5$…` 或 `user:*:$6$…`），所以可以让面板
+继续用 `/etc/ocserv/ocpasswd` 管理用户。
+
+### 3. 证书
+
+三种来源，任选：
+
+```bash
+# a) 已有证书
+-cert /etc/ssl/securev/vpn.example.com/fullchain.pem -key …/privkey.pem
+
+# b) 内置 Let's Encrypt（DNS-01，见下文）
+ocserv-go -acme-once -acme-domain vpn.example.com -acme-dns cloudflare …
+
+# c) 联调用自签
+-self-signed -domain vpn.example.com
+```
+
+### 4. 运行
+
+```bash
+./bin/ocserv-go \
+  -addr :443 -users users.txt \
+  -cert fullchain.pem -key privkey.pem \
+  -net 10.66.66.0/24 -ip 10.66.66.1 \
+  -dns 1.1.1.1,8.8.8.8 \
+  -mtu 1400 -dpd 30
+```
+
+### 5. 无特权 Docker
 
 ```bash
 docker build -t ocserv-go:dev ocserv-go
-docker run -d --name ocserv-go -p 443:443 \
+docker run -d --name ocserv-go -p 443:443 -p 443:443/udp \
   -v "$PWD/users.txt:/data/users.txt:ro" \
   -v "$PWD/certs:/certs:ro" \
   ocserv-go:dev -addr :443 -users /data/users.txt \
   -cert /certs/fullchain.pem -key /certs/privkey.pem
 ```
 
-工作原理、参数表、已验证项与限制见 [`ocserv-go/README.md`](ocserv-go/README.md)。
+注意：**没有** `--privileged`、**没有** `--device /dev/net/tun`、**没有** `--cap-add`。
 
-## 当前状态
-
-- **已完成**：AnyConnect 认证握手（**两种风格**：默认 `asa` 复刻 Cisco ASA 的 `/+webvpn+/index.html`
-  表单流程，`ocserv` 走标准 XML；含 `error id=15`、`webvpn` cookie；不做组选择）、
-  `CONNECT /CSTP` + CSTP 帧、**Cisco 风格 DTLS**（UDP 数据面）、gVisor 栈内的 TCP/UDP 代理、
-  客户端地址池、DPD 保活、可选 SOCKS5 出网出口、`-self-signed` 联调
-- **已验证**：`go test ./...`（含 `TestTunnelTCP` 完整链路：认证 → 隧道 → 访问宿主 HTTP 服务）、
-  手工 UDP 端到端、以 `nobody` 用户启动并正常响应
-- **面板适配**：面板新增「运行后端」`backend=go`，向导第 4 步生成 `ocserv-go.service`
-  并启动；用户仍用 `/etc/ocserv/ocpasswd`（Go 端兼容 `$5$/$6$` crypt 与 bcrypt），证书流程不变，
-  NAT 单元自动跳过（用户态出网）
-- **未做**：内置 Let's Encrypt、IPv6、压缩、分流量路由、CI
-
----
-
-> 以下内容继承自 `main` 分支，描述的是**主线套件**（C 版 ocserv + Web 管理面板）。
-> 在本分支上只有 `ocserv-go/` 是新增的，主线部分未改动，作为参考保留。
-
-# ocserv 部署套件
-
-
-一键装好 **ocserv（OpenConnect / Cisco AnyConnect 兼容 VPN）+ Web 管理面板**。
-安装脚本只负责装，域名、证书、VPN 用户、网段都在面板里配置。
-
-支持 Ubuntu / Debian（systemd）。
-
-> **先看效果**：面板有[在线演示](https://hakureiyuyuko.github.io/ocserv-deploy-kit/)
-> （GitHub Pages，纯前端 mock，无需安装，数据全是虚构示例）。
-
----
-
-## 快速开始
-
-### 1. 安装
+### 6. 浏览器预览（只看页面）
 
 ```bash
-tar xzf ocserv-deploy-kit-*.tar.gz
-cd ocserv-deploy-kit
-sudo ./install.sh --panel-port 19999 --admin-password '你的面板密码'
+./bin/ocserv-go -http -addr :8080 -users users.txt
 ```
 
-| 参数 | 说明 |
+打开 <http://localhost:8080/> 会像真机一样跳到 `/+CSCOE+/logon.html` 登录页，登录后进
+`/+CSCOE+/portal.html`。`-http` 仅用于预览，真实客户端必须走 TLS。
+
+---
+
+## 命令行参数
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `-addr` | `:443` | 监听地址（TCP） |
+| `-cert` / `-key` | — | TLS 证书 / 私钥 |
+| `-users` | 必填 | 用户文件（`user:hash` 或 ocpasswd 的 `user:group:hash`） |
+| `-net` | `10.66.66.0/24` | 客户端地址池 |
+| `-ip` | `10.66.66.1` | 隧道内服务端地址（必须在池内） |
+| `-dns` | `1.1.1.1` | 下发给客户端的 DNS（逗号分隔，最多 2 个） |
+| `-mtu` | `1400` | 隧道 MTU |
+| `-dpd` | `30` | 保活间隔（秒），0 关闭 |
+| `-socks` | — | 出网走 SOCKS5（TCP；UDP 直连） |
+| `-self-signed` | false | 无证书时生成自签 |
+| `-domain` | `ocserv-go.local` | 自签证书 CN / 下发默认域 |
+| `-style` | `asa` | 登录风格：`asa`（模拟 Cisco ASA）或 `ocserv`（标准 XML） |
+| `-dtls` | true | 启用 DTLS 数据面 |
+| `-dtls-port` | 同 `-addr` | DTLS 端口 |
+| `-http` | false | 明文 HTTP 预览模式（仅看页面） |
+| `-v` | false | 详细日志 |
+| `-version` | — | 显示版本 |
+| `-acme-once` | false | 申请/续期证书后退出 |
+| `-acme-domain` / `-acme-email` | — | ACME 域名 / 账号邮箱 |
+| `-acme-dns` | — | `cloudflare` / `alidns` / `tencentcloud` / `dnspod` |
+| `-acme-cache` | `/etc/ocserv-go/acme` | ACME 账号与缓存目录 |
+| `-acme-env` | `/etc/ocserv-go/acme.env` | 凭据文件（`KEY=VALUE`） |
+| `-acme-staging` | false | 用 LE staging |
+| `-acme-key-type` | `rsa2048` | 证书密钥类型（`ec256` 亦可，但 DTLS 需 RSA） |
+
+---
+
+## 两种登录风格
+
+### `asa`（默认）：模拟 Cisco ASA
+
+按照对真实 ASA 的抓包实现，路径与响应都对齐：
+
+| 请求 | 行为 |
 |---|---|
-| `--panel-port N` | 面板端口，默认 `19999` |
-| `--admin-password PW` | 面板管理员密码；不填则随机生成并打印 |
-| `--panel-host IP` | 面板监听地址，默认 `0.0.0.0`；只让内网访问就填内网 IP |
-| `--panel-title TXT` | 面板标题 |
-| `--no-node` | 不自动安装 Node.js（已自备 >= 18 时） |
+| `POST /`（XML init） | 404（真机就是不接受） |
+| `GET /` | AnyConnect UA → 302 `/+webvpn+/index.html` + `tg=` cookie；浏览器 → JS 跳 `/+CSCOE+/logon.html` |
+| `GET /+webvpn+/index.html` | `text/xml`、`X-Transcend-Version: 1`、裸 `<auth id="main">` |
+| `POST /+webvpn+/index.html` | 表单提交；失败插 `<error id="15" param1="" param2="">Login failed.</error>`；成功 `id="success"` + `webvpn` cookie |
+| `GET /+CSCOE+/logon.html` | 浏览器登录页（`unicorn_form`、csrf_token、USERNAME/PASSWORD、#858A91 边框） |
+| 静态资源 | `logon_custom.css` / `portal.css` / `win.js` / `csco_logo.gif` / `login-header-*.jpg` 均 200 |
+| `CONNECT /CSTP`（或 `/CSCOSSLC/tunnel`） | 200 CONNECTED + `X-CSTP-*` / `X-DTLS-*`，之后是 CSTP 二进制流 |
 
-安装脚本只做四件事：装依赖 → 装面板 → 停用 ocserv（等配置）→ 打印面板地址。
-不会碰域名、证书、VPN 用户和网段。
+页面骨架与真机一致，但**样式和图片是自绘占位**，不随包分发 Cisco 的商标或资源；
+也不内置任何具体站点的权限组名。
 
-### 2. 在面板里配置
+### `ocserv`：标准 XML 流程
 
-打开 `http://<机器IP>:19999` 登录后进入「配置向导」：
-
-1. **基础** — 域名、VPN 端口（默认 443）、客户端网段（默认 `10.66.66.0/24`）、下发 DNS、出口网卡
-2. **证书** — DNS-01 / HTTP-01 / 上传已有证书 / 自签（仅测试）
-3. **第一个 VPN 用户**
-4. **应用** — 写 ocserv.conf → 装证书 → 建用户 → 配 NAT 转发 → 装续期任务 → 启动 ocserv
-
-每一步都有日志回显，失败会说明卡在哪里。
-
-### 3. 更新与卸载
-
-```bash
-sudo ./update.sh              # 升级面板到本套件版本（默认静默，成功只打一行）
-sudo ./update.sh --help       # 看能透传哪些参数（如 --admin-password 顺便改面板密码）
-sudo ./uninstall.sh           # 卸载；默认保留 ocserv 配置 / VPN 用户 / 证书 / acme 账号
-sudo ./uninstall.sh --purge   # 连配置、证书、acme.sh 账号一起删（不可恢复）
-```
-
-- `update.sh` 只替换**面板程序、模块、模板与 systemd 单元**，不碰 ocserv 配置 / 证书 /
-  VPN 用户 / 网段 / 续期任务，也不重装依赖包，所以不会踢掉正在连接的 VPN 用户。
-  它还会从 systemd 单元里认出安装目录，已是最新版本时直接告诉你不用更新。
-- 升级/重装时**只有命令行显式给的参数才会覆盖**，其余配置（含向导里填的域名、证书路径、
-  网段、面板标题、管理员密码）全部沿用，不再被恢复成默认值。
-- `uninstall.sh` 默认会交互确认（删除范围列给你看）；脚本或非 tty 环境请加 `--yes`。
+`POST /` → `auth-request`，`POST /auth` → `auth-reply`（`<auth id="success"/>`）。
 
 ---
+
+## DTLS
+
+Cisco 的 DTLS 不是普通握手：客户端在 `CONNECT` 里用 `X-DTLS-Master-Secret` 给出
+48 字节主密钥，双方据此做**恢复握手**。
+
+实现方式：
+
+1. 读 `X-DTLS-Master-Secret`（96 hex）
+2. 生成 32 字节会话 ID，用 `X-DTLS-Session-ID` 下发
+3. 把主密钥按会话 ID 预置进 pion/dtls 的 `SessionStore`，握手走恢复流程
+4. 数据面切到 UDP：DTLS 上帧格式是 **`[1 字节类型][负载]`**（不是 8 字节 CSTP 头）
+5. 控制帧（DPD/保活）仍走 TCP；MTU 探针按原长度回 `type=4`
+
+协商头：
+
+```
+X-DTLS-Session-ID: <64 hex>
+X-DTLS-Port: 443
+X-DTLS-12: 1
+X-DTLS-DPD: 30
+X-DTLS-MTU: 1400
+X-DTLS12-CipherSuite: ECDHE-RSA-AES256-GCM-SHA384
+```
+
+> **需要 RSA 证书**（Cisco 用 ECDHE-RSA 套件）。ECDSA 证书时自动禁用 DTLS 并打日志；
+> 面板在 `backend=go` 时会用 RSA（ACME 2048 / 自签 rsa:2048）。
+
+## CSTP 头格式（TCP）
+
+```
+'S' 'T' 'F' 0x01 | 长度(大端, 字节 4-5) | 类型(字节 6) | 0(字节 7) | 负载
+```
+
+类型：`0` 数据、`3` DPD 请求、`4` DPD 应答、`5` 断开、`7` 保活、`8` 压缩、`9` 踢下线。
+
+---
+
+## 内置 Let's Encrypt（DNS-01）
+
+用 [lego](https://github.com/go-acme/lego) 在进程内签发，**不需要 acme.sh、不需要 80 端口**。
+
+```bash
+cat > /etc/ocserv-go/acme.env <<'EOF'
+CF_DNS_API_TOKEN=xxxxx
+EOF
+chmod 600 /etc/ocserv-go/acme.env
+
+ocserv-go -acme-once -acme-domain vpn.example.com -acme-dns cloudflare \
+  -acme-env /etc/ocserv-go/acme.env -acme-cache /etc/ocserv-go/acme \
+  -cert /etc/ssl/securev/vpn.example.com/fullchain.pem \
+  -key  /etc/ssl/securev/vpn.example.com/privkey.pem
+```
+
+| 服务商 | `-acme-dns` | 环境变量 |
+|---|---|---|
+| Cloudflare | `cloudflare` | `CF_DNS_API_TOKEN`（或 `CLOUDFLARE_DNS_API_TOKEN`） |
+| 阿里云 DNS | `alidns` | `ALICLOUD_ACCESS_KEY` + `ALICLOUD_SECRET_KEY` |
+| 腾讯云 DNSPod（API 密钥） | `tencentcloud` | `TENCENTCLOUD_SECRET_ID` + `TENCENTCLOUD_SECRET_KEY` |
+| DNSPod Token | `dnspod` | `DNSPOD_API_KEY`（`ID,Token`） |
+
+账号密钥与注册信息缓存在 `-acme-cache`，重复运行复用同一账号；`-acme-staging` 可打测试环境。
+默认签发 **RSA 2048**（DTLS 需要）。
+
+---
+
+## 管理面板集成
+
+仓库里的面板（`ocserv-panel/`）支持把这个后端当作一种「运行模式」，在
+`/opt/ocserv-panel/config.json` 里切换：
+
+```json
+{
+  "backend": "go",
+  "goBin": "/usr/local/bin/ocserv-go",
+  "goUnit": "ocserv-go",
+  "goMTU": 1400,
+  "goDTLS": true
+}
+```
+
+切换后：
+
+- 配置向导第 4 步不再写 `ocserv.conf`，而是生成并启动 `/etc/systemd/system/ocserv-go.service`
+- **跳过 NAT 单元**（进程内出网），状态页显示「不需要」
+- 用户管理照旧写 `/etc/ocserv/ocpasswd`，Go 后端直接读（`$5$/$6$` crypt 与 bcrypt）
+- 证书可选「**内置 DNS-01（Go 后端）**」：面板写 `/etc/ocserv-go/acme.env`、调用
+  `ocserv-go -acme-once`、并安装 `acme-renew-builtin.sh`（剩余 <30 天才申请）+ cron
+- 服务启停/状态/日志仍走 systemd（服务名取 `goUnit`）
+
+---
+
+## 验证过什么
+
+`go test ./...`：
+
+- `internal/cstp`：TCP 帧往返、非法魔数、超长拒绝
+- `internal/acxml` / `internal/asa`：认证 XML 解析、登录页/错误码/成功响应
+- `internal/ippool`：分配/释放/耗尽/非法配置
+- `internal/auth`：bcrypt、ocpasswd 的 `user:*:$5$…`、错误密码拒绝
+- 根包 `TestTunnelTCP`：ocserv 风格完整链路（TLS 认证 → CONNECT → CSTP → 客户端 gVisor 栈
+  → 服务端用户态栈 → 访问宿主 HTTP 服务 → 内容回传）
+- 根包 `TestASAStyle`：ASA 风格完整链路（302 → 登录 XML → 错误 → 成功 → 带 cookie 的
+  CONNECT → 隧道 UDP 往返）
+
+真客户端（openconnect 9.12）实测：
+
+```
+Established DTLS connection (using GnuTLS). Ciphersuite (DTLS1.2)-(ECDHE-RSA)-(AES-256-GCM).
+Configured as 10.66.66.2, with SSL connected and DTLS connected
+```
+
+连接持续 20 秒无重连；以 `nobody` 用户启动也能正常服务（验证无特权）。
+
+## 已知限制
+
+- **仅 IPv4**；IPv6 包丢弃
+- **只实现 AnyConnect/ASA 协议**（标准 OpenConnect 协议不在范围内）
+- 无压缩（CSTP 压缩帧未实现）
+- 路由固定全局，不下发 split include/exclude
+- ICMP 只回应隧道内地址，不代理到外网
+- 出网源地址是运行本进程的机器（上游看到宿主 IP）
+- 认证状态按连接维护，没有会话超时/重新认证策略
+- 无带宽限制、无多用户审计
+- DTLS 需要 RSA 证书
 
 ## 目录结构
 
 ```
-install.sh          安装入口（只装，不配业务）
-update.sh           更新面板（默认静默；只换面板程序，不碰配置/证书/用户）
-uninstall.sh        卸载（默认保留配置与证书，--purge 才清干净）
-ocserv-panel/       管理面板（Node >= 18，零第三方依赖）
-acme/               acme.sh 客户端 + 签发/续期脚本（单独使用时用）
-ocserv/             ocserv.conf 模板与 NAT 单元样板
-ocserv-go/          【本分支新增】Go 版服务端（用户态网络栈，无需 tun/特权）
-docs/               面板在线演示页（GitHub Pages 用，安装时不需要）
-tools/              演示页生成器（node tools/make-demo.mjs）
-Dockerfile          容器镜像（ocserv + 面板），说明见 docker/README.md
-docker/             容器入口脚本与 compose 示例
+ocserv-go/
+├── main.go              # 入口：TLS + HTTP(webvpn) + CSTP/DTLS 隧道
+├── internal/
+│   ├── asa/             # Cisco ASA 风格页面与 XML
+│   ├── acxml/           # ocserv 风格 XML 认证
+│   ├── auth/            # 用户库（bcrypt / crypt）
+│   ├── cstp/            # CSTP 帧 + DTLS 数据报
+│   ├── dtlsx/           # pion/dtls 封装 + 会话预置
+│   ├── usrnet/          # gVisor 用户态栈 + TCP/UDP 代理
+│   ├── ippool/          # 客户端地址池
+│   └── acme/            # 内置 Let's Encrypt（lego）
+├── Dockerfile           # 无特权镜像
+└── README.md            # 包级说明（指向本文件）
 ```
 
----
+## 路线图
 
-## 证书
+- [ ] IPv6 隧道
+- [ ] CSTP 压缩
+- [ ] split 路由（按用户/组）
+- [ ] 带宽限制与在线审计
+- [ ] 多架构镜像与 CI（构建 + `go test`）
+- [ ] 面板里显示内置 ACME 的账号/到期信息
 
-| 方式 | 需要什么 | 能否自动续期 |
-|---|---|---|
-| **DNS-01**（推荐） | 域名服务商的 API 凭据 | 能 |
-| HTTP-01 | 公网可访问本机 80 端口 | 能 |
-| 上传已有证书 | — | 不能（除非之后用上面两种方式签一次） |
-| 自签 | — | 不需要（仅测试，客户端会报证书不受信任） |
+## 许可
 
-DNS-01 内置 Cloudflare、阿里云、DNSPod、GoDaddy、DigitalOcean。**Cloudflare 用 API Token**（`cfat` 开头，
-权限只需 Zone → DNS → Edit），不是 Global API Key；`Account ID`、`Zone ID` 都可空（token 限定了单个区域时
-填 Zone ID 更稳）。面板会在提交前检查凭据形状，把「两栏填反」「粘到列表里脱敏的值」这类错误直接拦下，
-后端同样校验，签名之前就报错。其它服务商需在 `server.js` 的 `DNS_PROVIDERS` 里加一行（插件文件会自动
-下载），凭据存放于 `/etc/ocserv/acme-dns.env`（权限 600），续期任务会自动加载。
-
----
-
-## 面板功能
-
-概览（服务状态 / 监听端口 / 证书剩余 / 用户数 / 在线会话 / 系统负载，含服务启停）、
-配置向导、用户管理（含**认证方式**切换：本地密码文件 / PAM）、在线会话、选项（AnyConnect 兼容等开关）、日志、配置编辑、
-证书（详情 / 下次续期 / 手动续期 / 续期日志）、面板设置（改面板管理员密码 / 面板端口）。
-
-详见 `ocserv-panel/README.md`。
-
----
-
-## 容器镜像（Docker）
-
-不想在主机上装东西时可以跑容器（ocserv 1.2.4 + 面板）：
-
-```bash
-docker build -t ocserv-deploy-kit:1.6.2 .
-docker run -d --name ocserv \
-  --device /dev/net/tun --cap-add NET_ADMIN \
-  -e OC_DOMAIN=vpn.example.com -e VPN_USER=alice -e VPN_PASS='强密码' \
-  -e PANEL_ADMIN_PASSWORD='面板密码' \
-  -p 443:443/tcp -p 443:443/udp -p 19999:19999 \
-  ocserv-deploy-kit:1.6.2
-```
-
-配置、用户、NAT、自签证书都由入口脚本按环境变量生成（变量表与限制见
-[`docker/README.md`](docker/README.md)）。**容器里没有 systemd**：面板的服务启停、配置向导第 4 步、
-日志页（读 journal）不可用；需要面板全功能请用主机安装。
-
----
-
-## Alpine（OpenRC）
-
-Alpine 稳定仓库里**没有 ocserv 包**（3.18~3.24 都没有，只有 edge 有且依赖装不上），
-所以单独发一个一键包：`ocserv-deploy-kit-alpine-x86_64-<版本>.tar.gz`（见 Releases）。
-
-包内自带**现场编译的 ocserv 1.6.0 二进制 + 依赖库 + Node 24 + OpenRC 服务脚本**，目标机不用再拉包：
-
-```sh
-tar xzf ocserv-deploy-kit-alpine-x86_64-1.6.3.tar.gz
-cd ocserv-deploy-kit-alpine-x86_64-1.6.3
-sudo ./install.sh
-```
-
-面板同样在 `:19999`，向导流程一致。差异见 [`alpine/README.md`](alpine/README.md)：
-自动续期在 OpenRC 下会被跳过（acme.sh 需联网，续期脚本原本按 systemd 写），
-证书建议用「上传已有证书」；ocserv 版本是 1.6.0（比 Ubuntu 24.04 的 1.2.4 新）。
-
-面板的服务控制从 1.6.3 起走 `lib/svc.js`，按环境自动选 systemd 或 OpenRC，Debian/Ubuntu 行为不变。
-
----
-
-## 自动出包（GitHub Actions）
-
-推 `v*` 标签会触发 `.github/workflows/release.yml`：自动构建两个包并挂到该 Release
-（也可用 `workflow_dispatch` 手动跑，只出 artifact 不发 Release）。
-
-- `ocserv-deploy-kit-<版本>.tar.gz` —— 主线（Debian/Ubuntu，apt + systemd）
-- `ocserv-deploy-kit-alpine-x86_64-<版本>.tar.gz` —— Alpine（自编译 ocserv + OpenRC）
-
-构建逻辑与本地一致，主机侧入口是 `alpine/build-package.sh`：
-
-```bash
-bash alpine/build-package.sh --version 1.6.3 --out dist      # 需要 docker
-bash alpine/build-package.sh --version 1.6.3 --arch aarch64  # 交叉（需 binfmt/QEMU）
-```
-
-工作流会先校验 `install.sh` 的 `KIT_VERSION`、`ocserv-panel/server.js` 的 `VERSION` 与标签一致，
-再对产出的 Alpine 包做冒烟测试（用包内二进制跑 `--version`、`node -v`）。
-
----
-
-## 在线演示（GitHub Pages）
-
-`docs/` 是一个**纯静态**的面板演示页：把真实前端拿来，前面插一层本地 mock 接口
-（`tools/demo-mock.js`），所以点任何按钮都不会碰到服务器，数据全是虚构示例；
-域名填错、缺 DNS 凭据、端口被占用、密码错误这些**错误路径也照真实后端的行为还原**。
-
-- 在线地址：https://hakureiyuyuko.github.io/ocserv-deploy-kit/
-- 自己重新生成（改了面板后同步演示）：`node tools/make-demo.mjs`
-- 部署：仓库 Settings → Pages → Source 选 `Deploy from a branch`，分支 `main`、目录 `/docs`
-
-生产环境安装**不需要** `docs/` 与 `tools/`，发布包（`ocserv-deploy-kit-*.tar.gz`）里也不包含它们。
-
----
-
-## 注意事项
-
-- **面板端口不要对公网开放**，绑内网 IP 或隧道 IP 即可。
-- **VPN 客户端网段要和客户端本机网段岔开**（默认 `10.66.66.0/24`）。Windows 上装了 OpenVPN 类软件
-  常会留下 TAP 网卡并占用 `10.10.10.0/24`。
-- **网关做了端口翻译时 DTLS 会失败**：ocserv 会在 CONNECT 响应里宣告 `X-DTLS-Port`（等于本机 udp-port），
-  客户端按它发 UDP。要么端到端用同一个端口（不做翻译），要么额外放行 `UDP <本机端口>`。
-  DTLS 不通不影响使用（客户端自动降级到 TCP），只是性能差一些。
-- 云服务器安全组需放行 VPN 端口（**TCP + UDP**）。
-- 在面板「面板设置」里改过面板端口后，记得同步改路由器/安全组的端口映射，并用新地址访问。
-- 面板默认监听 `0.0.0.0` 且默认是**明文 HTTP**（单密码登录）。对 Homelab 而言，
-  “把 19999 也顺手映射到公网”比“VPN 软件本身有漏洞”风险高得多 —— 面板能改配置、建用户、启停服务。
-  只让内网/隧道访问。
-
----
-
-## ocserv 版本与安全更新（请自行权衡）
-
-**本套件不负责升级 ocserv**：安装脚本只做 `apt-get install ocserv`，之后完全交给系统包管理，
-套件不会自动升级、也不会替换 `/usr/sbin/ocserv`。下面是做决定所需的全部事实。
-
-### 各系统能拿到的版本
-
-| 系统 | 仓库里的 ocserv |
-|---|---|
-| Ubuntu 24.04 LTS | **1.2.4** |
-| Ubuntu 25.04 / Debian 13 (trixie) | 1.3.0 |
-| Debian sid | 1.5.0 |
-| 上游 [gitlab.com/openconnect/ocserv](https://gitlab.com/openconnect/ocserv) | **1.5.0**（2026-06） |
-
-发行版**只在有 CVE / 安全公告时**才发 `-security` 更新。实测：Ubuntu 24.04 的 ocserv
-没有 `-security` 更新，也没有对应 CVE —— 所以下面那些修复**不会**通过 `apt upgrade` 到达 24.04。
-
-### 上游 1.5.0 里的两项 `[SECURITY]`
-
-1. **未认证**可达：worker 进程堆溢出（超长 `webvpncontext=` cookie）。1.2.4 的同名代码
-   确实缺少长度校验（源码级确认），保守按“受影响”看待。
-2. **需要已认证客户端**才能触发：DTLS MTU 协商的无符号下溢（能触发的人已经有账号了，对普通部署基本无威胁）。
-
-两项都**没有 CVE 编号**，也没有公开 PoC / 在野利用报告 —— 所以扫描器和漏洞库不会主动提示你。
-
-### 后果与现成缓解
-
-- 最可能的实际后果：**打崩 worker → 连接中断**（反复打 = VPN 不可用）；再往上是 worker
-  被占（身份是**非特权** `ocserv` 用户，不是 root）。
-- 默认配置已经开着 `isolate-workers = true`，worker 也以非特权用户运行并带 seccomp：
-  每个连接一个短命非特权进程，把最坏后果压在“worker 级”。
-
-### 怎么权衡
-
-| 你的部署 | 建议 |
-|---|---|
-| VPN 端口只在**内网/隧道**暴露 | 跟着系统走就够了：定期 `sudo apt-get update && sudo apt-get install --only-upgrade ocserv`（只升这一个包，不要用 `apt upgrade`；在 24.04 上这条命令拿到的最新也就是 1.2.4） |
-| 端口**直接对公网开**（回家主力通道） | 按“值得处理”看待：至少**限制来源 IP** / 用非标端口减少被扫；想彻底就上 1.5.x（见下） |
-
-### 想用 1.5.x 的三条路
-
-1. **等发行版**：最省心，但要等新 LTS（Debian sid 已是 1.5.0）。
-2. **自编译上游**（适配的人）：1.5.0 已从 autotools 换成 **meson**，网上老教程的 `./configure`
-   不适用 —— 依赖清单与构建步骤以源码包里的 `README.md` / `INSTALL` 为准，默认装到 `/usr/local`，
-   不会覆盖发行版的 `/usr/sbin/ocserv`。
-   - ⚠️ **注意**：面板 `config.json` 里的 `ocservBin` **只影响面板自己读版本 / 跑 `--test-config`，
-     不会改变 systemd 实际启动哪个二进制**。要让服务真的跑新版，得用 systemd
-     drop-in 覆盖 `ExecStart`（先 `systemctl cat ocserv` 照抄参数，再 `systemctl edit ocserv`
-     改成 `/usr/local/sbin/ocserv ...`），否则就只是“面板显示新版本、实际还是旧的”。
-3. **只打最小补丁**：在 1.2.4 源码里把那处 cookie 解析照 1.5.0 的写法改（长度窗口校验 +
-   先解码到 `ws->buffer` 再 `memcpy` 到 `ws->sid`，连同 1.5.0 里那句 `sizeof(ws->buffer)` 断言一起照抄），
-   然后重编包。改动最小，不脱离发行版管理。
-
-> 无论走哪条路，都建议先备份 `/etc/ocserv/ocserv.conf`，并知道怎么回到发行版二进制：
-> `apt-mark unhold ocserv && apt install --reinstall ocserv`。
-
----
-
-## 排查
-
-- 面板 → 日志页看 `journalctl -u ocserv`；证书页看续期日志 `/var/log/acme-renew.log`。
-- **忘了面板管理员密码** → 先 `sudo cat /opt/ocserv-panel/admin-cred.txt`（安装与改密码时都会同步写这里）；
-  要重置就按 `ocserv-panel/README.md` 的「忘了管理员密码怎么办」用 root 改。面板没有网页找回入口（故意的），
-  也**不要**拿根目录的 `install.sh` 去重置 —— 它会把 ocserv 停掉。
-- **ocserv 版本 / 安全更新值不值得处理** —— 见上文「ocserv 版本与安全更新（请自行权衡）」；
-  日志里若反复出现 worker 崩溃/重启，说明有人在试或本身有其它问题。
-- **不装客户端也能自检服务端**（最后一步返回 `<auth id="success">` 即正常）：
-
-```bash
-B=https://<域名>:<端口>
-J="-sk -c /tmp/c -b /tmp/c -H 'Content-Type: application/x-www-form-urlencoded' -H 'X-Aggregate-Auth: 1'"
-X='<?xml version="1.0" encoding="UTF-8"?>'
-rm -f /tmp/c
-curl $J -X POST $B/     --data "$X<config-auth client=\"vpn\" type=\"init\"><version who=\"vpn\">4.10.04071</version><capabilities><auth-method>single-sign-on-v2</auth-method></capabilities></config-auth>"
-curl $J -X POST $B/auth --data "$X<config-auth client=\"vpn\" type=\"auth-reply\"><version who=\"vpn\">4.10.04071</version><auth><username>vpnuser</username></auth></config-auth>"
-curl $J -X POST $B/auth --data "$X<config-auth client=\"vpn\" type=\"auth-reply\"><version who=\"vpn\">4.10.04071</version><auth><username>vpnuser</username><password>密码</password></auth></config-auth>"
-```
-
-  > init 里必须带 `<capabilities><auth-method>single-sign-on-v2</auth-method></capabilities>`，
-  > 否则 ocserv 不会把后续 `auth-reply` 当成同一会话的下一步（表现为一直问用户名，像认证失败）。
-  > 也可以直接装 openconnect 测：
-  > `echo '密码' | openconnect --protocol=anyconnect --user=vpnuser --passwd-on-stdin --authenticate <域名>:<端口>`
-
-- **客户端登录后几秒就断开，`rx: 0, tx: 0`，`ip link` 里看不到 `vpns0`**
-  → 这是 `isolate-workers = true`（每个 worker 独立 TUN）在 **ARM32 / 老内核（< 4.9）** 上建不出设备。
-  1.6.7 起面板检测到这类环境会在应用配置时自动改成 `false`；也可在「选项」页手动关闭。
-  修复后日志里应看到 `vpns0` 出现并且 `RX/TX` 在增长。
-- **应用配置时报 `error: unknown user: ocserv`**
-  → Debian/Ubuntu 的 ocserv 包**不会**创建运行用户，而模板用的是 `run-as-user = ocserv`。
-  1.6.7 起 `install.sh` 会自动补建用户/组与 `/etc/ocserv/ocpasswd`；老部署可手动执行：
-  ```bash
-  groupadd --system ocserv; useradd --system -g ocserv -d /run/ocserv -s /usr/sbin/nologin ocserv
-  install -m 600 /dev/null /etc/ocserv/ocpasswd
-  ```
-- **`install.sh` 在 Node 版本检查处中止**（如 Ubuntu 20.04 源里只有 Node 10，或 ARM32）
-  → 1.6.7 起会自动下载官方二进制（`x64/arm64/armv7l/armv6l`，ARM32 封顶 22.x，因为 Node 24 起
-  不再提供 armv7l）。手动处理见脚本失败时打印的提示；arm 上还需要 `libatomic1`。
-- **面板说 NAT 未安装，但 `iptables -t nat -S` 里其实有 MASQUERADE**
-  → 1.6.7 起状态判断跟随 systemd/OpenRC 的路径；面板启动时如果发现
-  「配置里是 `route = default` 但 NAT 单元不存在」，会自动补装（分流路由的情况不会动）。
-- 连接异常时先排除域名被按 SNI 拦截（部分机房会拦特定域名）：
-  `openssl s_client -connect <IP>:<端口> -servername <你的域名>` 与
-  `openssl s_client -connect <IP>:<端口> -servername www.baidu.com` 对比，只有前者失败就是被拦了。
-
----
-
-## 迁移到新机器
-
-1. 面板 `config.json`、`/etc/ocserv/ocpasswd`（VPN 用户）、`/root/.acme.sh`（证书、账号与凭据）
-   可以直接拷到新机器。
-2. 把 `/root/.acme.sh` 放回后，在新面板向导里走到「证书」那步会提示证书仍有效、跳过签发，只做安装 ——
-   这样不会重复申请证书（同一组域名每周有 5 张的签发上限）。
-
----
-
-## 许可与第三方
-
-- **本套件**（安装 / 更新 / 卸载脚本、管理面板及其前端、`docs/` 演示页与 `tools/` 生成器）以
-  **GNU AGPL-3.0-or-later** 发布，全文见 [`LICENSE`](LICENSE)。
-  注意 AGPL 第 13 条：如果你**修改**了本面板并作为网络服务对外提供，需要向使用者提供对应源码。
-- **`acme/acme.sh`** 是上游 [acmesh-official/acme.sh](https://github.com/acmesh-official/acme.sh) 的
-  原样拷贝（未做任何修改），版本 `3.1.5`，采用 **GNU GPL-3.0**，许可证全文见 [`acme/LICENSE.md`](acme/LICENSE.md)。
-  校验值：`sha256 B81542B4A05EFA88638C727FF7185A44D996A3840C0E7D15B2200B8628301B51`。
-  面板是以**独立进程**调用它的（exec，不链接、不修改），两者属聚合分发，各自保留自己的许可证。
-- 打包不含任何证书、密钥、口令或 API 凭据；这些都在部署时由你本机生成。
-
----
-
-## 更新日志
-
-- **1.6.7** —— 一个功能修复 + 一组低配/ARM 适配：
-  ① 修「NAT 转发单元显示尚未安装」—— 状态页把路径写死成 systemd 的
-  `/etc/systemd/system/ocserv-nat.service`，OpenRC 下 NAT 装在 `/etc/init.d/ocserv-nat`；现在路径跟随
-  服务管理器，并显示「运行中 / 未运行」，重启提示也按后端给出正确命令。
-  ② `install.sh` 补建 `ocserv` 运行用户与 `ocpasswd`（Debian 系包不自带，否则应用配置报 unknown user）。
-  ③ Node 安装改为「apt 不行就下官方二进制」，识别 armv7l/armv6l 并封顶 22.x（Node 24 起无 ARM32 构建）。
-  ④ `isolate-workers` 在 ARM32 / 内核 < 4.9 上自动置为 false（这类环境每 worker 建 TUN 会失败，
-  表现为登录即断、rx/tx 为 0），并加进「选项」页。
-  ⑤ 面板启动自愈：`route = default` 但 NAT 单元缺失时自动补装。
-- **1.6.6** —— 修「acme.sh 已存在但 spawn ENOENT」：面板以前只看文件在不在，现在**实测能否执行**，
-  并统一用 `/bin/sh` 调 acme.sh（它本来就是 POSIX sh 脚本），这样首行是 `#!/bin/bash`
-  （Alpine 没 bash）或没有执行位也能跑；候选路径依次回退（配置值 → `/usr/bin/acme.sh` →
-  `~/.acme.sh/acme.sh`），全不可用才下载安装，且安装改用 `sh`、加 `--nocron`。
-- **1.6.5** —— Alpine 两处修复：① 服务起不来是因为精简系统/VM 上 tun 是内核模块、没加载时
-  `/dev/net/tun` 不存在，OpenRC 脚本现在自动 `modprobe tun` + `mknod`，并把失败原因写进
-  `/var/log/ocserv.log`；② 续期不再依赖 bash —— 新增 **POSIX sh** 版续期脚本 + busybox crond 的
-  `/etc/periodic/daily` 任务（acme.sh 本身是纯 sh，Alpine 官方包 `apk add acme.sh` 即可）。
-- **1.6.4** —— Alpine 包修复：补发 `ocserv-worker`（1.6 按「主程序路径 + `-worker`」查找，
-  名字必须是 `ocserv.real-worker`）、`occtl`、`ocpasswd`、`ocserv-fw`，并在 `/usr/local/sbin` 建入口
-  —— 之前向导里「用户创建失败: spawn ocpasswd ENOENT」就是漏了 ocpasswd；OpenRC 下不再安装
-  systemd 版续期脚本，服务启动改为轮询等待，失败时把 ocserv 日志尾部一起打印出来。
-- **1.6.3** —— 新增 **Alpine 支持**：面板的服务控制抽成 `lib/svc.js`（systemd / OpenRC 双后端），
-  状态、启停、热重载、日志（`journalctl` ↔ `/var/log/*.log`）、NAT 单元（systemd unit ↔ OpenRC 脚本）
-  都按运行环境自动切换；同时发布**独立的 Alpine 一键包**（自编译 ocserv 1.6.0 二进制 + 依赖库 +
-  Node 24 + OpenRC 单元），因为 Alpine 稳定仓库里没有 ocserv 包。Debian/Ubuntu 路径的行为不变。
-- **1.6.2** —— 面板 Cloudflare 的 DNS-01 凭据表单按 **API Token**（非 Global API Key）重做：字段带说明，
-  `Account ID` / `Zone ID` 标为可空并新增 `Zone ID` 输入（区域级 token 用）；前端提交前 + 后端写文件前
-  都做形状校验，把「把 Account ID 填进 Token 栏」「粘到列表里脱敏的 `cfat…3503`」这类错误直接拦下并说明原因。
-- **1.6.1** —— 面板「在线会话」页列名统一为固定列（ID / 用户 / 状态 / 设备 / 来源 IP / 建立时间），
-  不再直接暴露 `occtl` 的原始字段名；`occtl -j` 不可用时原样显示它的文本输出。
-- **1.6.0** —— 面板「用户管理」新增**认证方式切换**：本地密码文件（默认）/ **PAM**（把服务器加进 LDAP/AD 后走系统认证）。
-  切换会替换 ocserv 的 `auth` 行（ocserv 不允许两种密码认证并存），写前备份、`--test-config` 校验、失败自动回滚。
-  安装包内容不变，仅面板与文档。
-- **1.5.0** —— 新增 `update.sh`（静默更新：只换面板程序与 systemd 单元，不碰 ocserv 配置/证书/
-  用户/续期任务）与套件级 `uninstall.sh`（默认保留配置与证书，`--purge` 连数据一起清，`--yes`
-  供脚本调用）。同时修掉「重跑安装脚本会把向导写的域名/证书路径/网段/标题覆盖回默认值」的 bug：
-  升级时只有**显式传入**的参数才覆盖，其余全沿用；`ocserv-panel/install.sh` 也不再依赖当前工作目录。
-  另外仓库增加 **GitHub Pages 在线演示**（`docs/` + `tools/make-demo.mjs`），不进安装包。
-  文档补充：「ocserv 版本与安全更新（请自行权衡）」一节（各发行版版本、上游 1.5.0 的两项安全修复、
-  后果与缓解、三条升级路径）与面板暴露提醒。
-  另外把上游 acme.sh 的许可证全文补进 `acme/LICENSE.md`。
-- **1.4.0** —— 面板新增**「面板设置」页**：改管理员密码（立即生效）、改面板监听端口（改完自动重启面板；
-  改密码/端口都需输入当前密码，端口会先试监听，占用则不落盘）。安装脚本本身不变。
-- **1.3.1** —— 面向对外发布整理：移除内部排障记录，精简脚本输出与文档。
-- **1.3.0** —— 安装与配置分离：`install.sh` 只装（面板端口 + 管理员密码）；
-  域名、证书、VPN 用户、网段改为在面板「配置向导」里配置。
-- **1.2.3** —— 新增 `--cert-dir` / `--acme-home`：用本地已有证书部署，不联系 Let's Encrypt。
-- **1.2.2** —— 新增 DNS-01 验证；修正 `set -e` 与 acme.sh 退出码冲突。
-- **1.2.1** —— 修复安装脚本自身的两个问题。
-- **1.2.0** —— 首个套件版本。
+[AGPL-3.0-or-later](LICENSE)（与主仓库一致）。
