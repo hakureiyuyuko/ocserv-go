@@ -188,3 +188,76 @@ func Obtain(ctx context.Context, cfg Config, logf func(string, ...interface{})) 
 func NewTestKey() (crypto.PrivateKey, error) {
 	return ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 }
+
+// State 是「自动续期」需要的持久化参数（面板签发成功后写入，守护进程按它续期）。
+type State struct {
+	Domain   string `json:"domain"`
+	Provider string `json:"provider"`
+	Email    string `json:"email,omitempty"`
+	Staging  bool   `json:"staging,omitempty"`
+	EnvFile  string `json:"envFile,omitempty"`
+	CacheDir string `json:"cacheDir,omitempty"`
+}
+
+// SaveState 把续期参数写到 path（0600）。
+func SaveState(path string, st State) error {
+	b, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, append(b, '\n'), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// LoadState 读取续期参数；文件不存在返回 (nil, nil)。
+func LoadState(path string) (*State, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var st State
+	if err := json.Unmarshal(b, &st); err != nil {
+		return nil, fmt.Errorf("acme 续期配置不是合法 JSON: %v", err)
+	}
+	if st.EnvFile == "" {
+		st.EnvFile = "/etc/ocserv-go/acme.env"
+	}
+	if st.CacheDir == "" {
+		st.CacheDir = "/etc/ocserv-go/acme"
+	}
+	return &st, nil
+}
+
+// LoadEnvFile 把 KEY=VALUE 文件注入环境变量（供 lego 服务商读取）。
+func LoadEnvFile(path string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		if k == "" {
+			continue
+		}
+		_ = os.Setenv(k, v)
+	}
+	return nil
+}

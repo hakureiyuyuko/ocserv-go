@@ -67,13 +67,25 @@ type Listener struct {
 }
 
 // Listen 在 addr 上监听 DTLS。
+// Listen 用固定证书启动 DTLS 监听（保留旧接口）。
 func Listen(addr string, cert tls.Certificate, mtu int, store *Store) (*Listener, error) {
+	return ListenFunc(addr, func() (tls.Certificate, error) { return cert, nil }, mtu, store)
+}
+
+// ListenFunc 用回调取证书：证书续期后，新的 DTLS 握手会自动用新证书。
+func ListenFunc(addr string, getCert func() (tls.Certificate, error), mtu int, store *Store) (*Listener, error) {
 	ua, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("解析 DTLS 监听地址失败: %w", err)
 	}
 	cfg := &dtls.Config{
-		Certificates: []tls.Certificate{cert},
+		GetCertificate: func(*dtls.ClientHelloInfo) (*tls.Certificate, error) {
+			c, err := getCert()
+			if err != nil {
+				return nil, err
+			}
+			return &c, nil
+		},
 		// Cisco 的恢复握手不带 extended master secret，这里用默认（请求但不强制）
 		ExtendedMasterSecret: dtls.RequestExtendedMasterSecret,
 		ClientAuth:           dtls.NoClientCert,

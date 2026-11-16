@@ -190,6 +190,8 @@ docker run -d --name ocserv-go -p 443:443 -p 443:443/udp \
 | `-acme-env` | `/etc/ocserv-go/acme.env` | 凭据文件（`KEY=VALUE`） |
 | `-acme-staging` | false | 用 LE staging |
 | `-acme-key-type` | `rsa2048` | 证书密钥类型（`ec256` 亦可，但 DTLS 需 RSA） |
+| `-acme-auto` | true | 自动续期：按 `-acme-state` 检查，剩余 ≤30 天用内置 lego 续期 |
+| `-acme-state` | `/etc/ocserv-go/acme.json` | 自动续期配置（域名/服务商/邮箱/凭据路径，面板签发时写入） |
 
 ---
 
@@ -301,6 +303,25 @@ ocserv-go -acme-once -acme-domain vpn.example.com -acme-dns cloudflare \
 
 账号密钥与注册信息缓存在 `-acme-cache`，重复运行复用同一账号；`-acme-staging` 可打测试环境。
 默认签发 **RSA 2048**（DTLS 需要）。
+
+---
+
+## 证书自动续期（免维护）
+
+只要证书是由**面板的「内置 Let's Encrypt」**签发的，续期就是全自动的：
+
+- 面板签发成功后会写入 `/etc/ocserv-go/acme.json`（域名/服务商/邮箱/凭据路径）和
+  `/etc/ocserv-go/acme.env`（凭据，0600）；
+- 守护进程启动时检查一次，之后每 **6 小时**检查一次；剩余 **≤30 天**就用内置 lego 自动续期；
+- 续期结果**原子写入**证书文件，TLS/DTLS 都是每次握手取当前证书，所以**不需要重启、不会断线**；
+- 面板「证书」页会显示「自动续期：已启用 · 服务商 · 剩余 ≤30 天自动续」。
+
+相关参数：`-acme-auto`（默认开）、`-acme-state`（默认 `/etc/ocserv-go/acme.json`）。
+
+手动触发一次检查：重启服务即可（启动即检查）。
+
+> 从 acme.sh 迁移过来时要注意：acme.sh 会自己续期并在续期后重启服务。两者同时开会导致重复签发，
+> 建议把 acme.sh 的 cron 停掉（`crontab -l | grep -v acme.sh | crontab -`），由 ocserv-go 接管。
 
 ---
 

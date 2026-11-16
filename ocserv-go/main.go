@@ -9,7 +9,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha1"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -64,6 +63,8 @@ var (
 	dtlsPort   = flag.Int("dtls-port", 0, "DTLS 端口（默认与 -addr 相同）")
 	showVer    = flag.Bool("version", false, "显示版本后退出")
 	assetsDir  = flag.String("assets", "/etc/ocserv-go/assets", "用户上传的 Cisco 登录页资源目录（图片/CSS/logon.html）")
+	acmeAuto   = flag.Bool("acme-auto", true, "按 -acme-state 自动续期证书（面板签发时写入该文件）")
+	acmeState  = flag.String("acme-state", "/etc/ocserv-go/acme.json", "自动续期配置（域名/服务商/邮箱/凭据路径）")
 	icmpEcho   = flag.Bool("icmp-echo", true, "本地应答客户端的 ICMP ping（返回客户端到网关的延迟；false 则透传/丢弃）")
 	acmeOnce   = flag.Bool("acme-once", false, "申请/续期证书后退出（DNS-01，内置 lego）")
 	acmeDomain = flag.String("acme-domain", "", "ACME 域名（-acme-once 时必填）")
@@ -98,7 +99,7 @@ func withSession(ctx context.Context, c net.Conn) context.Context {
 
 type server struct {
 	users     *auth.Users
-	certHash  string
+	certStore *certStore
 	assetsDir string
 	icmpEcho  bool
 	pendMu    sync.Mutex
@@ -144,7 +145,7 @@ type serverConfig struct {
 	Addr      string
 	DTLS      bool
 	DTLSPort  int
-	CertHash  string
+	CertStore *certStore
 	AssetsDir string
 	ICMPEcho  bool
 	Dial      usrnet.DialFunc
@@ -167,7 +168,7 @@ func newServer(c serverConfig) (*server, error) {
 		dpd:       time.Duration(c.DPD) * time.Second,
 		dns:       c.DNS,
 		prefix:    ones,
-		certHash:  c.CertHash,
+		certStore: c.CertStore,
 		assetsDir: c.AssetsDir,
 		icmpEcho:  c.ICMPEcho,
 		serverIP:  net.ParseIP(c.ServerIP),
@@ -235,6 +236,15 @@ func main() {
 		log.Printf("警告: %s 里没有任何用户，所有登录都会被拒绝（到面板「用户管理」添加）", *usersFile)
 	}
 
+	// 证书热加载：磁盘上的证书被续期/替换后，下一次握手自动用新的
+	store, err := newCertStore(*certFile, *keyFile, *domain, *selfSigned || *certFile == "" || *keyFile == "")
+	if err != nil {
+		log.Fatalf("加载证书失败: %v", err)
+	}
+	if *selfSigned || *certFile == "" || *keyFile == "" {
+		log.Printf("使用自签证书（CN=%s），客户端会提示不受信任", *domain)
+	}
+
 	s, err := newServer(serverConfig{
 		Users:     users,
 		ClientNet: *clientNet,
@@ -247,7 +257,7 @@ func main() {
 		Addr:      *addr,
 		DTLS:      *dtlsOn && !*httpOnly,
 		DTLSPort:  *dtlsPort,
-		CertHash:  certHashHex,
+		CertStore: store,
 		AssetsDir: *assetsDir,
 		ICMPEcho:  *icmpEcho,
 		Dial:      buildDialer(*socksAddr),
@@ -258,21 +268,25 @@ func main() {
 
 	var tlsCfg *tls.Config
 	if !*httpOnly {
-		tlsCfg, err = tlsConfig()
+		tlsCfg, err = tlsConfig(store)
 		if err != nil {
 			log.Fatalf("TLS 配置失败: %v", err)
 		}
-		s.certHash = certHashHex // webvpnc cookie 里的 &sh:（证书 SHA1）
 	}
 
 	// DTLS 监听（与 TCP 同端口，UDP）。
 	// Cisco 的 DTLS 用 ECDHE-RSA 套件，证书必须是 RSA（真机也是）。
 	if s.dtlsEnabled() {
-		cert := tlsCfg.Certificates[0]
-		if !certIsRSA(cert) {
+		if !store.IsRSA() {
 			log.Printf("!! 当前证书不是 RSA，Cisco 风格 DTLS 需要 RSA 证书，DTLS 已禁用")
 		} else {
-			ln, derr := dtlsx.Listen(fmt.Sprintf(":%d", s.dtlsPort), cert, s.mtu, dtlsx.NewStore())
+			ln, derr := dtlsx.ListenFunc(fmt.Sprintf(":%d", s.dtlsPort), func() (tls.Certificate, error) {
+				c, err := store.Get()
+				if err != nil {
+					return tls.Certificate{}, err
+				}
+				return *c, nil
+			}, s.mtu, dtlsx.NewStore())
 			if derr != nil {
 				log.Printf("!! DTLS 启动失败（将只用 TCP）: %v", derr)
 			} else {
@@ -281,6 +295,10 @@ func main() {
 				log.Printf("DTLS 监听: udp :%d", s.dtlsPort)
 			}
 		}
+	}
+
+	if *acmeAuto && !*httpOnly {
+		go runAutoRenew(context.Background(), *acmeState, store, log.Printf)
 	}
 
 	hs := &http.Server{
@@ -348,37 +366,14 @@ func buildDialer(socks string) usrnet.DialFunc {
 	}
 }
 
-// certHashHex 是服务器证书 DER 的 SHA1（大写 hex）。AnyConnect 客户端从
-// 成功响应的 webvpnc cookie 里读 &sh:<这个值> 来定位隧道/校验证书，
-// 缺了它客户端认证通过后不会继续发 CONNECT（表现为"未能建立连接"）。
-var certHashHex string
-
-func tlsConfig() (*tls.Config, error) {
-	var cert tls.Certificate
-	var err error
-	switch {
-	case *certFile != "" && *keyFile != "":
-		cert, err = tls.LoadX509KeyPair(*certFile, *keyFile)
-		if err != nil {
-			return nil, err
-		}
-	case *selfSigned:
-		cert, err = makeSelfSigned(*domain)
-		if err != nil {
-			return nil, err
-		}
-		log.Printf("使用自签证书（CN=%s），客户端会提示不受信任", *domain)
-	default:
-		return nil, fmt.Errorf("需要 -cert/-key，或加 -self-signed 联调")
-	}
-	if len(cert.Certificate) > 0 {
-		sum := sha1.Sum(cert.Certificate[0])
-		certHashHex = strings.ToUpper(hex.EncodeToString(sum[:]))
-	}
+func tlsConfig(store *certStore) (*tls.Config, error) {
 	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
-		NextProtos:   []string{"http/1.1"},
+		// 每次握手都取当前证书：磁盘上的证书被续期/替换后会立即生效
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return store.Get()
+		},
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"http/1.1"},
 	}, nil
 }
 
@@ -864,12 +859,16 @@ func (s *server) handleAuth(w http.ResponseWriter, r *http.Request, body []byte)
 // 缺了它认证通过后不会继续发 CONNECT。
 func (s *server) writeSuccess(w http.ResponseWriter, ctxTok, token string) {
 	body := acxml.SuccessComplete()
+	certHash := ""
+	if s.certStore != nil {
+		certHash = s.certStore.Hash()
+	}
 	h := w.Header()
 	h.Set("Content-Type", "text/xml; charset=utf-8")
 	h.Set("X-Transcend-Version", "1")
 	h.Set("Content-Length", strconv.Itoa(len(body)))
 	http.SetCookie(w, &http.Cookie{Name: "webvpn", Value: token, Path: "/", Secure: s.secure, HttpOnly: true})
-	http.SetCookie(w, &http.Cookie{Name: "webvpnc", Value: "bu:/&p:t&iu:1/&sh:" + s.certHash, Path: "/", Secure: s.secure, HttpOnly: true})
+	http.SetCookie(w, &http.Cookie{Name: "webvpnc", Value: "bu:/&p:t&iu:1/&sh:" + certHash, Path: "/", Secure: s.secure, HttpOnly: true})
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
 }

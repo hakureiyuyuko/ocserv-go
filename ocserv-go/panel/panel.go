@@ -313,7 +313,19 @@ func (p *Panel) handleCertProviders(w http.ResponseWriter, _ *http.Request, _ st
 }
 
 func (p *Panel) handleCertInfo(w http.ResponseWriter, _ *http.Request, _ string) {
-	writeJSON(w, http.StatusOK, p.CertInfo())
+	ci := p.CertInfo()
+	st, _ := acme.LoadState(p.cfg.AcmeState)
+	auto := map[string]any{"enabled": st != nil, "stateFile": p.cfg.AcmeState, "thresholdDays": 30}
+	if st != nil {
+		auto["domain"] = st.Domain
+		auto["provider"] = st.Provider
+		auto["staging"] = st.Staging
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"exists": ci.Exists, "subject": ci.Subject, "issuer": ci.Issuer,
+		"notAfter": ci.NotAfter, "daysLeft": ci.DaysLeft, "san": ci.SAN, "isRsa": ci.IsRSA,
+		"autoRenew": auto,
+	})
 }
 
 func (p *Panel) handleCertPost(w http.ResponseWriter, r *http.Request, _ string) {
@@ -422,6 +434,14 @@ func (p *Panel) handleCertPost(w http.ResponseWriter, r *http.Request, _ string)
 	default:
 		fail(w, http.StatusBadRequest, "未知操作")
 		return
+	}
+
+	// ACME 签发成功：把续期参数交给守护进程（它按这个文件自动续期）
+	if in.Action == "acme" {
+		_ = acme.SaveState(p.cfg.AcmeState, acme.State{
+			Domain: domain, Provider: in.Provider, Email: in.Email,
+			Staging: in.Staging, EnvFile: p.cfg.AcmeEnv, CacheDir: "/etc/ocserv-go/acme",
+		})
 	}
 
 	p.cfg.Domain = domain

@@ -87,6 +87,13 @@ onMounted(load)
         <span class="mono">{{ info.isRsa ? 'RSA（DTLS 可用）' : 'ECDSA（DTLS 会被禁用）' }}</span>
       </div>
       <div class="kv"><span class="muted">SAN</span><span class="mono">{{ (info.san || []).join(', ') || '-' }}</span></div>
+      <div class="kv">
+        <span class="muted">自动续期</span>
+        <span v-if="info.autoRenew && info.autoRenew.enabled" class="tag ok">
+          已启用 · {{ info.autoRenew.provider }} · 剩余 ≤{{ info.autoRenew.thresholdDays }} 天自动续
+        </span>
+        <span v-else class="tag warn">未启用（用「内置 Let's Encrypt」签发一次后自动开启）</span>
+      </div>
     </template>
     <p v-else class="muted">尚未安装证书</p>
   </div>

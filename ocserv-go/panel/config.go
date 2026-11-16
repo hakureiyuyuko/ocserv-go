@@ -36,6 +36,7 @@ type Config struct {
 	UsersFile     string                `json:"usersFile"`
 	AssetsDir     string                `json:"assetsDir"`
 	AcmeEnv       string                `json:"acmeEnv"`
+	AcmeState     string                `json:"acmeState"`
 	CertFile      string                `json:"certFile"`
 	KeyFile       string                `json:"keyFile"`
 	Domain        string                `json:"domain"`
@@ -59,6 +60,7 @@ func DefaultConfig() *Config {
 		UsersFile:  "/etc/ocserv/ocpasswd",
 		AssetsDir:  "/etc/ocserv-go/assets",
 		AcmeEnv:    "/etc/ocserv-go/acme.env",
+		AcmeState:  "/etc/ocserv-go/acme.json",
 		VPNPort:    443,
 		VPNNet:     "10.66.66.0/24",
 		VPNMTU:     1400,
@@ -187,6 +189,9 @@ func (c *Config) normalize() {
 	}
 	if c.AcmeEnv == "" {
 		c.AcmeEnv = d.AcmeEnv
+	}
+	if c.AcmeState == "" {
+		c.AcmeState = d.AcmeState
 	}
 	if c.VPNPort == 0 {
 		c.VPNPort = d.VPNPort
