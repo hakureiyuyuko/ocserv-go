@@ -267,7 +267,7 @@ sed -i -e 's/@DOMAIN@/你的域名/' -e 's/@OCSERV_SERVICE@/ocserv/' -e 's/@PANE
 | 配置 | `/etc/ocserv/ocserv.conf` | 不写 conf，生成 `/etc/systemd/system/ocserv-go.service` |
 | 网络 | 需要 tun + NAT 单元 | **进程内出网**，不装 NAT、不需要 tun/特权 |
 | 用户库 | `/etc/ocserv/ocpasswd` | 同一个文件（ocserv-go 兼容 ocpasswd 格式） |
-| 证书 | 同一套 | 同一套（`certFile` / `keyFile`） |
+| 证书 | 同一套 | 同一套，另可选**内置 DNS-01**（cloudflare/alidns/tencentcloud/dnspod） |
 | 状态/日志 | systemd | systemd（服务名取 `goUnit`） |
 
 切到 `go` 后，向导第 4 步会生成单元并启动；「用户管理」照常写 ocpasswd，

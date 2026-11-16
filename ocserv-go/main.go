@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +30,7 @@ import (
 
 	"golang.org/x/net/proxy"
 
+	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/acme"
 	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/acxml"
 	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/asa"
 	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/auth"
@@ -58,6 +60,14 @@ var (
 	dtlsOn     = flag.Bool("dtls", true, "启用 DTLS（UDP 数据面，与 TCP 同端口）")
 	dtlsPort   = flag.Int("dtls-port", 0, "DTLS 端口（默认与 -addr 相同）")
 	showVer    = flag.Bool("version", false, "显示版本后退出")
+	acmeOnce   = flag.Bool("acme-once", false, "申请/续期证书后退出（DNS-01，内置 lego）")
+	acmeDomain = flag.String("acme-domain", "", "ACME 域名（-acme-once 时必填）")
+	acmeEmail  = flag.String("acme-email", "", "ACME 账号邮箱（可空）")
+	acmeDNS    = flag.String("acme-dns", "", "DNS 服务商: cloudflare / alidns / tencentcloud / dnspod")
+	acmeCache  = flag.String("acme-cache", "/etc/ocserv-go/acme", "ACME 账号与缓存目录")
+	acmeEnv    = flag.String("acme-env", "/etc/ocserv-go/acme.env", "凭据环境变量文件（KEY=VALUE）")
+	acmeStage  = flag.Bool("acme-staging", false, "用 Let's Encrypt staging 环境")
+	acmeKeyTyp = flag.String("acme-key-type", "rsa2048", "证书密钥类型: rsa2048 / ec256")
 	verbose    = flag.Bool("v", false, "详细日志")
 )
 
@@ -173,6 +183,9 @@ func main() {
 	if *showVer {
 		fmt.Println(version)
 		return
+	}
+	if *acmeOnce {
+		os.Exit(runACMEOnce())
 	}
 
 	// 子命令：哈希
@@ -1021,4 +1034,79 @@ func (s *server) tunnel(ctx context.Context, conn net.Conn, br *bufio.Reader, us
 			return
 		}
 	}
+}
+
+// loadEnvFile 读取 KEY=VALUE 形式的环境变量文件。
+func loadEnvFile(path string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		i := strings.IndexByte(line, '=')
+		if i <= 0 {
+			continue
+		}
+		k := strings.TrimSpace(line[:i])
+		v := strings.Trim(strings.TrimSpace(line[i+1:]), `"'`)
+		_ = os.Setenv(k, v)
+	}
+	return nil
+}
+
+// runACMEOnce 用内置 lego 做 DNS-01 签发，把证书写到 -cert / -key 指定的位置。
+func runACMEOnce() int {
+	if *acmeDomain == "" {
+		log.Printf("X 需要 -acme-domain")
+		return 2
+	}
+	if *acmeDNS == "" {
+		log.Printf("X 需要 -acme-dns（%s）", strings.Join(acme.Supported(), " / "))
+		return 2
+	}
+	if *acmeEnv != "" {
+		if err := loadEnvFile(*acmeEnv); err != nil {
+			log.Printf("! 读取凭据文件 %s 失败: %v（若凭据已在环境变量里可忽略）", *acmeEnv, err)
+		}
+	}
+	certOut := *certFile
+	keyOut := *keyFile
+	if certOut == "" {
+		certOut = "/etc/ssl/securev/" + *acmeDomain + "/fullchain.pem"
+	}
+	if keyOut == "" {
+		keyOut = "/etc/ssl/securev/" + *acmeDomain + "/privkey.pem"
+	}
+
+	log.Printf("内置 ACME（DNS-01）: 域名=%s 提供商=%s 缓存=%s staging=%v", *acmeDomain, *acmeDNS, *acmeCache, *acmeStage)
+	certPEM, keyPEM, err := acme.Obtain(context.Background(), acme.Config{
+		Domain:   *acmeDomain,
+		Email:    *acmeEmail,
+		Provider: *acmeDNS,
+		CacheDir: *acmeCache,
+		Staging:  *acmeStage,
+		KeyType:  *acmeKeyTyp,
+	}, log.Printf)
+	if err != nil {
+		log.Printf("X 签发失败: %v", err)
+		return 1
+	}
+	if err := os.MkdirAll(filepath.Dir(certOut), 0755); err != nil {
+		log.Printf("X 创建证书目录失败: %v", err)
+		return 1
+	}
+	if err := os.WriteFile(certOut, certPEM, 0644); err != nil {
+		log.Printf("X 写证书失败: %v", err)
+		return 1
+	}
+	if err := os.WriteFile(keyOut, keyPEM, 0600); err != nil {
+		log.Printf("X 写私钥失败: %v", err)
+		return 1
+	}
+	log.Printf("v 证书已写入 %s / %s", certOut, keyOut)
+	return 0
 }

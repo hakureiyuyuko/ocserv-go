@@ -302,6 +302,16 @@
         <label class="muted"><input type="radio" name="wzmode" value="upload"> 上传已有证书</label>
         <label class="muted"><input type="radio" name="wzmode" value="selfsigned"> 自签（仅测试）</label>
       </div>
+      <div id="wzBuiltin" class="hide">
+        <div class="row" style="margin-bottom:8px">
+          <label class="muted" style="width:110px">DNS 服务商</label>
+          <select id="wzBuiltinProv"></select>
+        </div>
+        <div id="wzBuiltinFields"></div>
+        <div class="muted" style="font-size:12px;margin-top:6px">
+          凭据会写入 <code>/etc/ocserv-go/acme.env</code>（600），由 ocserv-go 内置的 lego 完成 DNS-01。
+        </div>
+      </div>
       <div id="wzDns">
         <div class="row" style="margin-bottom:8px">
           <label class="muted" style="width:110px">DNS 服务商</label>
@@ -692,6 +702,7 @@ function wzMode() { const r = document.querySelector('input[name=wzmode]:checked
 function wzSyncMode() {
   const m = wzMode();
   $('#wzDns').classList.toggle('hide', m !== 'dns');
+  $('#wzBuiltin').classList.toggle('hide', m !== 'builtin');
   $('#wzUpload').classList.toggle('hide', m !== 'upload');
 }
 // 凭据形状自检（与服务端 lib/tpl.js 的 dnsCredsIssue 同规则）：先把“两栏填反”挡在提交前
@@ -720,6 +731,19 @@ function wzRenderProv() {
     (f.hint ? '<div class="muted" style="font-size:12px;line-height:1.5;margin-top:2px;max-width:460px">' + esc(f.hint) + '</div>' : '') +
     '</div></div>').join('');
 }
+function wzRenderBuiltin() {
+  if (!wzSetup) return;
+  const list = wzSetup.builtinProviders || [];
+  const sel = $('#wzBuiltinProv');
+  if (!sel.options.length) {
+    sel.innerHTML = list.map((x) => '<option value="' + esc(x.id) + '">' + esc(x.name) + '</option>').join('');
+  }
+  const p = list.filter((x) => x.id === sel.value)[0] || { fields: [] };
+  $('#wzBuiltinFields').innerHTML = (p.fields || []).map((f) =>
+    '<div class="row" style="margin-bottom:6px"><label class="muted" style="width:110px">' + esc(f.label) + '</label>' +
+    '<input data-bcred="' + esc(f.k) + '" placeholder="' + esc(f.k) + '" style="width:320px" autocomplete="off"></div>').join('');
+}
+
 function wzRenderState() {
   if (!wzSetup) { $('#wzState').textContent = '加载中…'; return; }
   const s = wzSetup, svc = s.service || {}, c = s.cert || {};
@@ -764,11 +788,13 @@ async function loadWizard() {
     $('#wzDomain').value = d;
   }
   wzRenderProv();
+  wzRenderBuiltin();
   wzSyncMode();
   wzRenderState();
 }
 document.querySelectorAll('input[name=wzmode]').forEach((r) => { r.onchange = wzSyncMode; });
 $('#wzProv').onchange = wzRenderProv;
+$('#wzBuiltinProv').onchange = wzRenderBuiltin;
 $('#wzRand').onclick = () => { $('#wzPass').value = genPass(); };
 $('#wzCertBtn').onclick = async () => {
   const m = wzMode();
@@ -777,6 +803,11 @@ $('#wzCertBtn').onclick = async () => {
     body.provider = $('#wzProv').value;
     body.creds = {};
     document.querySelectorAll('#wzFields input[data-cred]').forEach((i) => { body.creds[i.dataset.cred] = i.value.trim(); });
+    body.extra = $('#wzExtra').value.split(/[\n,]+/).map((x) => x.trim()).filter(Boolean);
+  } else if (m === 'builtin') {
+    body.provider = $('#wzBuiltinProv').value;
+    body.creds = {};
+    document.querySelectorAll('#wzBuiltinFields input[data-bcred]').forEach((i) => { body.creds[i.dataset.bcred] = i.value.trim(); });
     body.extra = $('#wzExtra').value.split(/[\n,]+/).map((x) => x.trim()).filter(Boolean);
   } else if (m === 'upload') { body.cert = $('#wzCertPem').value; body.key = $('#wzKeyPem').value; }
   if (!body.domain) return toast('先填域名', 'warn');

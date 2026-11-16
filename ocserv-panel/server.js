@@ -469,6 +469,24 @@ const ACME_MIRRORS = [
 ];
 // 常用 DNS 服务商(其余可用「额外变量」填插件名需改代码 + KEY=VALUE)
 // fields: k=环境变量名 / label=界面标签 / opt=可空 / hint=输入框下方说明
+// 内置 ACME（ocserv-go + lego）使用的提供商，字段名就是 lego 读的环境变量
+const ACME_BUILTIN_PROVIDERS = [
+  { id: 'cloudflare', name: 'Cloudflare（DNS API Token）', fields: [
+    { k: 'CF_DNS_API_TOKEN', label: 'DNS API Token' }
+  ] },
+  { id: 'alidns', name: '阿里云 DNS', fields: [
+    { k: 'ALICLOUD_ACCESS_KEY', label: 'AccessKey ID' },
+    { k: 'ALICLOUD_SECRET_KEY', label: 'AccessKey Secret' }
+  ] },
+  { id: 'tencentcloud', name: '腾讯云 DNSPod（API 密钥）', fields: [
+    { k: 'TENCENTCLOUD_SECRET_ID', label: 'SecretId' },
+    { k: 'TENCENTCLOUD_SECRET_KEY', label: 'SecretKey' }
+  ] },
+  { id: 'dnspod', name: 'DNSPod Token', fields: [
+    { k: 'DNSPOD_API_KEY', label: 'ID,Token' }
+  ] }
+];
+
 const DNS_PROVIDERS = [
   { id: 'cf',   name: 'Cloudflare', fields: [
     { k: 'CF_Token',      label: 'API Token',  hint: 'cfat 开头、40 位以上，创建时只显示一次（列表里「值」列是脱敏的，别从那复制）。权限只需 Zone → DNS → Edit（DNS Write）；不要用 Global API Key。' },
@@ -518,6 +536,7 @@ async function setupStatus() {
     outIf: await detectOutIf(),
     templates: { ok: tpl('ocserv.conf.tpl') !== null, dir: TPL_DIR },
     providers: DNS_PROVIDERS,
+    builtinProviders: ACME_BUILTIN_PROVIDERS,
     presets: { vpnPort: 443, vpnNet: '10.66.66.0', vpnMask: '255.255.255.0', dns1: '1.1.1.1', dns2: '8.8.8.8', dnssleep: 30 }
   };
 }
@@ -682,6 +701,70 @@ function saveCertCfg(domain) {
 
 function natUnit(cidr, iface) { return TPL.natUnit(cidr, iface, CFG.ocservService); }
 
+// doCertBuiltin：用 ocserv-go 内置的 lego 做 DNS-01（cloudflare/alidns/tencentcloud/dnspod）
+async function doCertBuiltin(p, L) {
+  if (CFG.backend !== 'go') { L('x 「内置 DNS-01」只用于 Go 后端，请先把 backend 设为 go'); return false; }
+  const domain = String(p.domain || '').trim().toLowerCase();
+  if (!validDomain(domain)) { L('x 域名不合法'); return false; }
+  const provider = String(p.provider || '').trim();
+  const meta = ACME_BUILTIN_PROVIDERS.filter((x) => x.id === provider)[0];
+  if (!meta) { L('x 不支持的 DNS 服务商: ' + (provider || '(空)')); return false; }
+  if (!fileInfo(CFG.goBin)) { L('x 找不到 ocserv-go: ' + CFG.goBin); return false; }
+
+  // 凭据写成环境变量文件（600）
+  const creds = (p.creds && typeof p.creds === 'object') ? p.creds : {};
+  const lines = [];
+  const env = {};
+  for (const f of meta.fields) {
+    const v = String(creds[f.k] == null ? '' : creds[f.k]).trim();
+    if (!v) { L('x 缺少 ' + f.label + '（' + f.k + '）'); return false; }
+    lines.push(f.k + '=' + v);
+    env[f.k] = v;
+  }
+  if (Array.isArray(p.extra)) {
+    for (const raw of p.extra) {
+      const t = String(raw || '').trim();
+      const i = t.indexOf('=');
+      if (i <= 0) continue;
+      const k = t.slice(0, i).trim(), v = t.slice(i + 1).trim();
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) continue;
+      lines.push(k + '=' + v);
+      env[k] = v;
+    }
+  }
+  try { fs.mkdirSync('/etc/ocserv-go/acme', { recursive: true, mode: 0o700 }); } catch (e) {}
+  writeAs('/etc/ocserv-go/acme.env', '# 由面板「配置向导」写入（内置 DNS-01）；600\n' + lines.join('\n') + '\n', 0o600);
+  L('v 凭据已写入 /etc/ocserv-go/acme.env (600)：' + Object.keys(env).join(' '));
+
+  const certDir = '/etc/ssl/securev/' + domain;
+  try { fs.mkdirSync(certDir, { recursive: true }); } catch (e) {}
+  const args = [
+    '-acme-once',
+    '-acme-domain', domain,
+    '-acme-dns', provider,
+    '-acme-cache', '/etc/ocserv-go/acme',
+    '-acme-env', '/etc/ocserv-go/acme.env',
+    '-cert', certDir + '/fullchain.pem',
+    '-key', certDir + '/privkey.pem'
+  ];
+  if (p.email) args.push('-acme-email', String(p.email));
+  if (p.staging) args.push('-acme-staging');
+
+  L('签发: ocserv-go ' + args.join(' '));
+  const r = await run(CFG.goBin, args, null, 300000, env);
+  const out = ((r.out || '') + (r.err || '')).trim();
+  for (const line of out.split('\n').slice(-12)) L('  ' + line);
+  if (r.code !== 0) { L('x 内置 DNS-01 签发失败'); return false; }
+  if (!fileInfo(certDir + '/fullchain.pem')) { L('x 证书文件没生成'); return false; }
+  L('v 证书已写入 ' + certDir);
+  CFG.acmeBuiltinProvider = provider;
+  CFG.acmeBuiltinEmail = String(p.email || '');
+  saveConfig(CFG);
+  saveCertCfg(domain);
+  await verifyCert(L, domain);
+  return true;
+}
+
 async function doCert(p, L) {
   const mode = String(p.mode || '');
   const domain = String(p.domain || '').trim().toLowerCase();
@@ -720,6 +803,9 @@ async function doCert(p, L) {
     return true;
   }
 
+  if (mode === 'builtin') {
+    return doCertBuiltin(p, L);
+  }
   if (mode !== 'dns' && mode !== 'http') { L('x 未知的证书方式: ' + (mode || '(空)')); return false; }
   const email = String(p.email || '').trim();
   const env = {};
@@ -836,6 +922,24 @@ async function applyGo(L, o) {
     await new Promise((r) => setTimeout(r, 600));
     st = await ocservStatus();
   }
+  // 内置 DNS-01 的续期：剩余 < 30 天时才申请，避免 LE 频率限制
+  if (CFG.acmeBuiltinProvider) {
+    const renew = '/usr/local/bin/acme-renew-builtin.sh';
+    const script = [
+      '#!/bin/sh',
+      '# 由面板生成：内置 DNS-01 续期（仅当证书 <30 天时申请）',
+      'CERT=' + CFG.certFile,
+      'if openssl x509 -in "$CERT" -noout -checkend $((30*86400)) >/dev/null 2>&1; then exit 0; fi',
+      'exec ' + [bin, '-acme-once', '-acme-domain', o.domain, '-acme-dns', CFG.acmeBuiltinProvider,
+        '-acme-cache', '/etc/ocserv-go/acme', '-acme-env', '/etc/ocserv-go/acme.env',
+        '-cert', CFG.certFile, '-key', CFG.keyFile].join(' '),
+      ''
+    ].join('\n');
+    writeAs(renew, script, 0o755);
+    await run('bash', ['-c', "crontab -l 2>/dev/null | grep -v acme-renew-builtin > /tmp/.ct2 || true; echo '30 3 * * * /usr/local/bin/acme-renew-builtin.sh' >> /tmp/.ct2; crontab /tmp/.ct2"]);
+    L('v 已安装内置 DNS-01 续期脚本 + cron（每天 03:30，<30 天才申请）');
+  }
+
   L('  Go 后端在进程内出网：不需要 tun / iptables / NET_ADMIN，也不需要 NAT 单元');
   L((st.active === 'active' ? 'v' : 'x') + ' ocserv-go 服务: ' + st.active + '/' + (st.SubState || '-'));
   L('v 监听: ' + (st.listen || []).map((x) => x.proto + ' ' + x.port).join(' · ') + '  客户端网段 ' + net + '  隧道地址 ' + serverIP);

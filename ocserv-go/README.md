@@ -216,6 +216,36 @@ MTU 探针（类型 3）会按原长度回 `type=4`。
 
 类型：0=数据 3=DPD 4=DPD 应答 5=断开 7=保活 8=压缩 9=踢下线。
 
+## 内置 Let's Encrypt（DNS-01）
+
+不需要 acme.sh：用 lego 在进程内完成 DNS-01 签发，支持 **Cloudflare / 阿里云 / 腾讯云 / DNSPod**。
+
+```bash
+# 凭据写进环境变量文件（600）
+cat > /etc/ocserv-go/acme.env <<'EOF'
+CF_DNS_API_TOKEN=xxxxx
+EOF
+
+ocserv-go -acme-once -acme-domain vpn.example.com -acme-dns cloudflare \
+  -acme-env /etc/ocserv-go/acme.env \
+  -acme-cache /etc/ocserv-go/acme \
+  -cert /etc/ssl/securev/vpn.example.com/fullchain.pem \
+  -key  /etc/ssl/securev/vpn.example.com/privkey.pem
+```
+
+| 提供商 | `-acme-dns` | 环境变量 |
+|---|---|---|
+| Cloudflare | `cloudflare` | `CF_DNS_API_TOKEN`（或 `CLOUDFLARE_DNS_API_TOKEN`） |
+| 阿里云 | `alidns` | `ALICLOUD_ACCESS_KEY` + `ALICLOUD_SECRET_KEY` |
+| 腾讯云 DNSPod（API 密钥） | `tencentcloud` | `TENCENTCLOUD_SECRET_ID` + `TENCENTCLOUD_SECRET_KEY` |
+| DNSPod Token | `dnspod` | `DNSPOD_API_KEY`（`ID,Token`） |
+
+其他参数：`-acme-email`、`-acme-staging`（测试环境）、`-acme-key-type rsa2048|ec256`。
+默认签发 **RSA 2048**（Cisco 风格 DTLS 需要）。
+
+面板里对应「证书 → 内置 DNS-01（Go 后端）」：填提供商与凭据，面板写 `/etc/ocserv-go/acme.env`、
+调用上面的命令、并把续期脚本 `acme-renew-builtin.sh`（<30 天才申请）+ cron 装好。
+
 ## 已知限制
 
 - **仅 IPv4**；IPv6 包直接丢弃
