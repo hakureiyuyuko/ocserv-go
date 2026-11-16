@@ -1,6 +1,6 @@
 // Package asa 复刻 Cisco ASA（AnyConnect）的 webvpn 登录流程。
 //
-// 与 ocserv 的差别（抓包对比 Cisco ASA）：
+// 与 ocserv 的差别（按 Cisco ASA 的公开行为实现）：
 //   - 客户端先 GET / → 302 到 /+webvpn+/index.html（非 AnyConnect UA 则返回带 JS 跳转的 HTML）
 //   - 登录页是 text/xml，根节点直接是 <auth id="main">，不是 <config-auth>
 //   - 提交用 application/x-www-form-urlencoded（group_list/username/password），不是 XML
