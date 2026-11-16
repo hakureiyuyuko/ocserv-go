@@ -142,12 +142,13 @@ header button { background: transparent; color: #f9fafb; border-color: #374151; 
 .spacer { flex: 1; }
 .body { display: flex; flex: 1; align-items: stretch; }
 nav {
-  width: 172px; padding: 12px 10px; background: #fff; border-right: 1px solid var(--line);
+  flex: 0 0 172px; width: 172px; padding: 12px 10px; background: #fff;
+  border-right: 1px solid var(--line);
   display: flex; flex-direction: column; gap: 4px;
 }
-nav button { text-align: left; border: 0; background: transparent; padding: 9px 12px; border-radius: 6px; }
+nav button { text-align: left; white-space: nowrap; border: 0; background: transparent; padding: 9px 12px; border-radius: 6px; }
 nav button.on { background: #eff6ff; color: var(--primary); font-weight: 600; }
-main { flex: 1; padding: 18px; max-width: 1080px; }
+main { flex: 1; min-width: 0; padding: 18px; max-width: 1080px; }
 .toast {
   position: fixed; right: 18px; bottom: 18px; padding: 10px 16px; border-radius: 8px;
   background: #111827; color: #fff; box-shadow: 0 6px 24px rgba(0,0,0,.18);
