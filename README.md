@@ -1,4 +1,64 @@
+# ocserv-go 分支
+
+> **这是 `ocserv-go` 分支**：用 Go 重写 ocserv 的 AnyConnect 数据面，走**用户态网络栈**（gVisor），
+> 目标是在**无特权的 LXC / Docker** 里跑 —— 不需要 `/dev/net/tun`、不需要 `NET_ADMIN`、
+> 不需要 `iptables` / `ip_forward`。
+>
+> **生产部署请用 [`main`](https://github.com/hakureiyuyuko/ocserv-deploy-kit) 分支**。
+> 本分支是实验性的：只替换服务端数据面，管理面板 / 证书 / 部署脚本仍以 main 为准（下文原样保留作参考）。
+
+## 两个分支怎么选
+
+| | `main`（生产） | `ocserv-go`（本分支，实验） |
+|---|---|---|
+| 服务端实现 | C 版 ocserv（发行版包） | Go 重写，代码在 `ocserv-go/` |
+| 数据面 | 内核 TUN + `iptables MASQUERADE` | gVisor 用户态 TCP/IP 栈，进程内 socket 代理出网 |
+| 权限要求 | 需要 `/dev/net/tun` 与 `NET_ADMIN` | **不需要任何特权**（能监听端口即可） |
+| 适用环境 | 普通 VM / 有特权的容器 | 无特权 LXC、受限 Docker、PaaS |
+| 管理面板 | 有（配置向导 / 用户 / 证书 / 日志） | 暂无（命令行 + 用户文件） |
+| DTLS / IPv6 | 支持 | 暂无（仅 IPv4，TCP/UDP 代理） |
+| 稳定性 | 稳定 | 实验性 |
+
+## 快速开始（本分支）
+
+```bash
+cd ocserv-go
+go build -o bin/ocserv-go .
+./bin/ocserv-go hash '你的密码'        # 生成 bcrypt 行，写进 users.txt
+./bin/ocserv-go -addr :443 -users users.txt \
+  -cert fullchain.pem -key privkey.pem -dns 1.1.1.1
+```
+
+Docker（注意：**没有** `--privileged` / `--device` / `--cap-add`）：
+
+```bash
+docker build -t ocserv-go:dev ocserv-go
+docker run -d --name ocserv-go -p 443:443 \
+  -v "$PWD/users.txt:/data/users.txt:ro" \
+  -v "$PWD/certs:/certs:ro" \
+  ocserv-go:dev -addr :443 -users /data/users.txt \
+  -cert /certs/fullchain.pem -key /certs/privkey.pem
+```
+
+工作原理、参数表、已验证项与限制见 [`ocserv-go/README.md`](ocserv-go/README.md)。
+
+## 当前状态
+
+- **已完成**：AnyConnect 认证握手（**两种风格**：默认 `asa` 复刻 Cisco ASA 的 `/+webvpn+/index.html`
+  表单流程，`ocserv` 走标准 XML；含 `error id=15`、`webvpn` cookie；不做组选择）、
+  `CONNECT /CSTP` + CSTP 帧、gVisor 栈内的 TCP/UDP 代理、客户端地址池、DPD 保活、
+  可选 SOCKS5 出网出口、`-self-signed` 联调
+- **已验证**：`go test ./...`（含 `TestTunnelTCP` 完整链路：认证 → 隧道 → 访问宿主 HTTP 服务）、
+  手工 UDP 端到端、以 `nobody` 用户启动并正常响应
+- **未做**：DTLS（下一步）、内置 Let's Encrypt、IPv6、压缩、分流量路由、与面板集成、CI
+
+---
+
+> 以下内容继承自 `main` 分支，描述的是**主线套件**（C 版 ocserv + Web 管理面板）。
+> 在本分支上只有 `ocserv-go/` 是新增的，主线部分未改动，作为参考保留。
+
 # ocserv 部署套件
+
 
 一键装好 **ocserv（OpenConnect / Cisco AnyConnect 兼容 VPN）+ Web 管理面板**。
 安装脚本只负责装，域名、证书、VPN 用户、网段都在面板里配置。
@@ -69,6 +129,7 @@ uninstall.sh        卸载（默认保留配置与证书，--purge 才清干净�
 ocserv-panel/       管理面板（Node >= 18，零第三方依赖）
 acme/               acme.sh 客户端 + 签发/续期脚本（单独使用时用）
 ocserv/             ocserv.conf 模板与 NAT 单元样板
+ocserv-go/          【本分支新增】Go 版服务端（用户态网络栈，无需 tun/特权）
 docs/               面板在线演示页（GitHub Pages 用，安装时不需要）
 tools/              演示页生成器（node tools/make-demo.mjs）
 Dockerfile          容器镜像（ocserv + 面板），说明见 docker/README.md
