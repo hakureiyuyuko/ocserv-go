@@ -4,7 +4,8 @@
 数据面换成 **gVisor 用户态 TCP/IP 栈** —— 所以**不需要 `/dev/net/tun`、不需要 `NET_ADMIN`、
 不需要 `iptables` / `ip_forward`**，无特权 LXC / Docker / PaaS 里都能跑。
 
-> 状态：**实验分支**（`ocserv-go`）。生产部署请用 [`main`](https://github.com/hakureiyuyuko/ocserv-deploy-kit) 分支的 C 版 ocserv。
+> 当前版本 **1.0.0**（`ocserv-go` 分支）。生产部署仍建议用
+> [`main`](https://github.com/hakureiyuyuko/ocserv-deploy-kit) 分支的 C 版 ocserv。
 
 ---
 
@@ -47,6 +48,37 @@ ocserv-go
 ---
 
 ## 快速开始
+
+### 0. 用发行包安装（推荐）
+
+从 [Releases](https://github.com/hakureiyuyuko/ocserv-deploy-kit/releases) 下载对应架构：
+
+```
+ocserv-go-1.0.0-linux-amd64.tar.gz     # x86_64
+ocserv-go-1.0.0-linux-arm64.tar.gz     # aarch64
+```
+
+```bash
+tar xzf ocserv-go-1.0.0-linux-amd64.tar.gz
+cd ocserv-go-1.0.0-linux-amd64
+sudo ./install.sh --domain vpn.example.com --user alice
+```
+
+`install.sh` 会自己判断环境：
+
+- 按 `uname -m` 校验包内二进制能否执行（架构不符会直接报错，不会装错）
+- 识别 **systemd**（Debian/Ubuntu）或 **OpenRC**（Alpine），写对应服务单元并开机自启
+- 没有证书时生成自签 **RSA**（DTLS 需要）；`/etc/ocserv/ocpasswd` 为空时创建 `admin` 并打印密码
+- 缺 `openssl` 时会尝试用 `apk/apt/dnf` 自动补装
+- 支持 `--uninstall` 卸载（保留配置/证书/用户）
+
+常用参数：`--domain` `--port` `--cert` `--key` `--users` `--net` `--ip` `--dns`
+`--user` `--password` `--prefix` `--no-start`。
+
+> 已在**无特权 LXC** 里实测：Alpine 3.24（OpenRC）与 Debian 13（systemd）都能一键装好、
+> 开机自启、TCP+UDP 监听并完成认证。
+
+
 
 ### 1. 编译
 

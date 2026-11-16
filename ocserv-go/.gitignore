@@ -1,1 +1,5 @@
 /bin/
+/dist/
+/pkg/
+*.tar.gz
+SHA256SUMS

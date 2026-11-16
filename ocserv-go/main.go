@@ -40,7 +40,7 @@ import (
 	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/usrnet"
 )
 
-const version = "0.1.0"
+const version = "1.0.0"
 
 var (
 	addr       = flag.String("addr", ":443", "监听地址")
