@@ -1,0 +1,461 @@
+package panel
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/json"
+	"encoding/pem"
+	"math/big"
+	"net"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/hakureiyuyuko/ocserv-go/internal/acme"
+)
+
+// Panel 是管理面板（API + 内嵌前端）。
+type Panel struct {
+	cfg      *Config
+	sessions *sessions
+	version  string
+	web      http.Handler
+}
+
+// New 构造面板。version 会显示在页面上。
+func New(cfg *Config, version string) *Panel {
+	return &Panel{
+		cfg:      cfg,
+		sessions: newSessions(),
+		version:  version,
+		web:      newWebHandler(),
+	}
+}
+
+// Config 返回当前配置（只读用）。
+func (p *Panel) Config() *Config { return p.cfg }
+
+// Handler 返回整个面板的 http.Handler。
+func (p *Panel) Handler() http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("POST /api/login", p.handleLogin)
+	mux.HandleFunc("POST /api/logout", p.withAuth(p.handleLogout))
+	mux.HandleFunc("GET /api/me", p.withAuth(p.handleMe))
+
+	mux.HandleFunc("GET /api/overview", p.withAuth(p.handleOverview))
+	mux.HandleFunc("GET /api/users", p.withAuth(p.handleUsersList))
+	mux.HandleFunc("POST /api/users", p.withAuth(p.handleUsersPost))
+	mux.HandleFunc("POST /api/service", p.withAuth(p.handleService))
+	mux.HandleFunc("GET /api/logs", p.withAuth(p.handleLogs))
+	mux.HandleFunc("GET /api/cert", p.withAuth(p.handleCertInfo))
+	mux.HandleFunc("POST /api/cert", p.withAuth(p.handleCertPost))
+	mux.HandleFunc("GET /api/config", p.withAuth(p.handleConfigGet))
+	mux.HandleFunc("POST /api/config", p.withAuth(p.handleConfigPost))
+	mux.HandleFunc("POST /api/panel/password", p.withAuth(p.handlePanelPassword))
+	mux.HandleFunc("GET /api/panel", p.withAuth(p.handlePanelInfo))
+
+	mux.Handle("/", p.web)
+	return mux
+}
+
+// ---- 基础工具 ----
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func fail(w http.ResponseWriter, code int, msg string) {
+	writeJSON(w, code, map[string]any{"error": msg})
+}
+
+func sessionToken(r *http.Request) string {
+	if c, err := r.Cookie("sid"); err == nil {
+		return c.Value
+	}
+	return ""
+}
+
+func (p *Panel) withAuth(h func(http.ResponseWriter, *http.Request, string)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Header.Get("X-Panel") != "1" {
+			fail(w, http.StatusForbidden, "缺少 X-Panel 头")
+			return
+		}
+		user, ok := p.sessions.get(sessionToken(r))
+		if !ok {
+			fail(w, http.StatusUnauthorized, "未登录")
+			return
+		}
+		h(w, r, user)
+	}
+}
+
+// ---- 登录 ----
+
+func (p *Panel) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("X-Panel") != "1" {
+		fail(w, http.StatusForbidden, "缺少 X-Panel 头")
+		return
+	}
+	var in struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		fail(w, http.StatusBadRequest, "请求体不是合法 JSON")
+		return
+	}
+	cred, ok := p.cfg.PanelUsers[in.Username]
+	if !ok || !VerifyPassword(in.Password, cred) {
+		fail(w, http.StatusUnauthorized, "用户名或密码错误")
+		return
+	}
+	tok := p.sessions.create(in.Username, 12*time.Hour)
+	http.SetCookie(w, &http.Cookie{Name: "sid", Value: tok, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: 12 * 3600})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "user": in.Username})
+}
+
+func (p *Panel) handleLogout(w http.ResponseWriter, r *http.Request, _ string) {
+	p.sessions.drop(sessionToken(r))
+	http.SetCookie(w, &http.Cookie{Name: "sid", Value: "", Path: "/", MaxAge: -1, HttpOnly: true})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (p *Panel) handleMe(w http.ResponseWriter, _ *http.Request, user string) {
+	writeJSON(w, http.StatusOK, map[string]any{"user": user, "version": p.version, "title": p.cfg.Title})
+}
+
+// ---- 概览 ----
+
+func (p *Panel) handleOverview(w http.ResponseWriter, _ *http.Request, _ string) {
+	active, enabled := p.ServiceState()
+	users := ReadUsers(p.cfg.UsersFile)
+	names := make([]string, 0, len(users))
+	for _, u := range users {
+		names = append(names, u.Name)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"service": map[string]any{
+			"name": p.cfg.Service, "active": active, "enabled": enabled,
+			"port": p.cfg.VPNPort,
+		},
+		"cert":  p.CertInfo(),
+		"users": map[string]any{"count": len(users), "names": names},
+		"config": map[string]any{
+			"domain": p.cfg.Domain, "vpnPort": p.cfg.VPNPort, "vpnNet": p.cfg.VPNNet,
+			"vpnMtu": p.cfg.VPNMTU, "vpnDns": p.cfg.VPNDNS,
+		},
+		"version": p.version,
+	})
+}
+
+// ---- 用户 ----
+
+func (p *Panel) handleUsersList(w http.ResponseWriter, _ *http.Request, _ string) {
+	writeJSON(w, http.StatusOK, map[string]any{"users": ReadUsers(p.cfg.UsersFile)})
+}
+
+func (p *Panel) handleUsersPost(w http.ResponseWriter, r *http.Request, _ string) {
+	var in struct {
+		Action   string `json:"action"`
+		Name     string `json:"name"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		fail(w, http.StatusBadRequest, "请求体不是合法 JSON")
+		return
+	}
+	var err error
+	switch in.Action {
+	case "add", "passwd":
+		err = AddUser(p.cfg.UsersFile, in.Name, in.Password)
+	case "del":
+		err = DelUser(p.cfg.UsersFile, in.Name)
+	default:
+		fail(w, http.StatusBadRequest, "未知操作")
+		return
+	}
+	if err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// ocserv-go 会按文件 mtime 自动热加载用户库，无需重启
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "users": ReadUsers(p.cfg.UsersFile)})
+}
+
+// ---- 服务控制 ----
+
+func (p *Panel) handleService(w http.ResponseWriter, r *http.Request, _ string) {
+	var in struct {
+		Action string `json:"action"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		fail(w, http.StatusBadRequest, "请求体不是合法 JSON")
+		return
+	}
+	if err := p.ServiceAction(in.Action); err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	time.Sleep(800 * time.Millisecond)
+	active, enabled := p.ServiceState()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "active": active, "enabled": enabled})
+}
+
+func (p *Panel) handleLogs(w http.ResponseWriter, r *http.Request, _ string) {
+	n, _ := strconv.Atoi(r.URL.Query().Get("lines"))
+	writeJSON(w, http.StatusOK, map[string]any{"text": p.Logs(n)})
+}
+
+// ---- 证书 ----
+
+func (p *Panel) handleCertInfo(w http.ResponseWriter, _ *http.Request, _ string) {
+	writeJSON(w, http.StatusOK, p.CertInfo())
+}
+
+func (p *Panel) handleCertPost(w http.ResponseWriter, r *http.Request, _ string) {
+	var in struct {
+		Action   string `json:"action"` // selfsigned | upload | acme
+		Domain   string `json:"domain"`
+		Cert     string `json:"cert"`
+		Key      string `json:"key"`
+		Email    string `json:"email"`
+		Provider string `json:"provider"`
+		Staging  bool   `json:"staging"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		fail(w, http.StatusBadRequest, "请求体不是合法 JSON")
+		return
+	}
+	domain := strings.TrimSpace(in.Domain)
+	if domain == "" {
+		domain = p.cfg.Domain
+	}
+	if domain == "" {
+		fail(w, http.StatusBadRequest, "请先填写域名")
+		return
+	}
+	certDir := certDir(domain)
+	if err := osMkdirAll(certDir); err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	certFile := certDir + "/fullchain.pem"
+	keyFile := certDir + "/privkey.pem"
+
+	switch in.Action {
+	case "selfsigned":
+		if err := selfSigned(domain, certFile, keyFile); err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	case "upload":
+		if !strings.Contains(in.Cert, "BEGIN CERTIFICATE") || !strings.Contains(in.Key, "PRIVATE KEY") {
+			fail(w, http.StatusBadRequest, "证书或私钥不像 PEM")
+			return
+		}
+		if err := osWrite(certFile, in.Cert, 0o644); err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if err := osWrite(keyFile, in.Key, 0o600); err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	case "acme":
+		if in.Provider == "" {
+			fail(w, http.StatusBadRequest, "请选择 DNS 服务商")
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+		defer cancel()
+		certPEM, keyPEM, err := acme.Obtain(ctx, acme.Config{
+			Domain: domain, Email: in.Email, Provider: in.Provider,
+			CacheDir: "/etc/ocserv-go/acme", Staging: in.Staging, KeyType: "rsa2048",
+		}, func(f string, a ...any) {})
+		if err != nil {
+			fail(w, http.StatusBadGateway, "ACME 签发失败: "+err.Error())
+			return
+		}
+		if err := osWrite(certFile, string(certPEM), 0o644); err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if err := osWrite(keyFile, string(keyPEM), 0o600); err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	default:
+		fail(w, http.StatusBadRequest, "未知操作")
+		return
+	}
+
+	p.cfg.Domain = domain
+	p.cfg.CertFile = certFile
+	p.cfg.KeyFile = keyFile
+	if err := p.cfg.Save(); err != nil {
+		fail(w, http.StatusInternalServerError, "保存配置失败: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cert": certInfoOf(certFile)})
+}
+
+// ---- 配置（VPN 参数）----
+
+func (p *Panel) handleConfigGet(w http.ResponseWriter, _ *http.Request, _ string) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"domain": p.cfg.Domain, "vpnPort": p.cfg.VPNPort, "vpnNet": p.cfg.VPNNet,
+		"vpnMtu": p.cfg.VPNMTU, "vpnDns": p.cfg.VPNDNS,
+		"unit": p.cfg.RenderUnit(),
+	})
+}
+
+func (p *Panel) handleConfigPost(w http.ResponseWriter, r *http.Request, _ string) {
+	var in struct {
+		Domain  string   `json:"domain"`
+		VPNPort int      `json:"vpnPort"`
+		VPNNet  string   `json:"vpnNet"`
+		VPNMTU  int      `json:"vpnMtu"`
+		VPNDNS  []string `json:"vpnDns"`
+		Apply   bool     `json:"apply"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		fail(w, http.StatusBadRequest, "请求体不是合法 JSON")
+		return
+	}
+	if _, _, err := net.ParseCIDR(in.VPNNet); err != nil {
+		fail(w, http.StatusBadRequest, "客户端网段不合法（形如 10.66.66.0/24）")
+		return
+	}
+	if in.VPNPort < 1 || in.VPNPort > 65535 {
+		fail(w, http.StatusBadRequest, "端口不合法")
+		return
+	}
+	if in.VPNMTU < 576 || in.VPNMTU > 1500 {
+		fail(w, http.StatusBadRequest, "MTU 应在 576~1500")
+		return
+	}
+	if len(in.VPNDNS) == 0 {
+		fail(w, http.StatusBadRequest, "至少填一个 DNS")
+		return
+	}
+	p.cfg.Domain = strings.TrimSpace(in.Domain)
+	p.cfg.VPNPort = in.VPNPort
+	p.cfg.VPNNet = in.VPNNet
+	p.cfg.VPNMTU = in.VPNMTU
+	p.cfg.VPNDNS = in.VPNDNS
+	if p.cfg.Domain != "" && p.cfg.CertFile == "" {
+		p.cfg.CertFile = certDir(p.cfg.Domain) + "/fullchain.pem"
+		p.cfg.KeyFile = certDir(p.cfg.Domain) + "/privkey.pem"
+	}
+	if err := p.cfg.Save(); err != nil {
+		fail(w, http.StatusInternalServerError, "保存配置失败: "+err.Error())
+		return
+	}
+	if err := p.cfg.WriteUnit(); err != nil {
+		fail(w, http.StatusInternalServerError, "写入 systemd 单元失败: "+err.Error())
+		return
+	}
+	if in.Apply {
+		if err := p.ServiceAction("restart"); err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "unit": p.cfg.RenderUnit()})
+}
+
+// ---- 面板自身 ----
+
+func (p *Panel) handlePanelInfo(w http.ResponseWriter, _ *http.Request, user string) {
+	names := make([]string, 0, len(p.cfg.PanelUsers))
+	for n := range p.cfg.PanelUsers {
+		names = append(names, n)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"version": p.version, "title": p.cfg.Title, "listen": p.cfg.Listen,
+		"users": names, "me": user,
+		"usersFile": p.cfg.UsersFile, "certFile": p.cfg.CertFile, "keyFile": p.cfg.KeyFile,
+	})
+}
+
+func (p *Panel) handlePanelPassword(w http.ResponseWriter, r *http.Request, user string) {
+	var in struct {
+		Old string `json:"oldPassword"`
+		New string `json:"newPassword"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		fail(w, http.StatusBadRequest, "请求体不是合法 JSON")
+		return
+	}
+	cred, ok := p.cfg.PanelUsers[user]
+	if !ok || !VerifyPassword(in.Old, cred) {
+		fail(w, http.StatusBadRequest, "当前密码不正确")
+		return
+	}
+	if len(in.New) < 6 {
+		fail(w, http.StatusBadRequest, "新密码至少 6 位")
+		return
+	}
+	p.cfg.PanelUsers[user] = HashPassword(in.New)
+	if err := p.cfg.Save(); err != nil {
+		fail(w, http.StatusInternalServerError, "保存配置失败: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// ---- 自签证书 ----
+
+func selfSigned(domain, certFile, keyFile string) error {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return err
+	}
+	serial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	tmpl := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: domain},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{domain},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		return err
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	if err := osWrite(certFile, string(certPEM), 0o644); err != nil {
+		return err
+	}
+	return osWrite(keyFile, string(keyPEM), 0o600)
+}
+
+func osWrite(path, body string, mode os.FileMode) error {
+	if err := os.MkdirAll(dirOf(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(body), mode)
+}
+
+func osMkdirAll(dir string) error { return os.MkdirAll(dir, 0o755) }
+
+func dirOf(p string) string {
+	i := strings.LastIndexByte(p, '/')
+	if i <= 0 {
+		return "."
+	}
+	return p[:i]
+}

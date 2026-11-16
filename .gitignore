@@ -24,3 +24,6 @@ Thumbs.db
 desktop.ini
 # CI/本地构建产出
 dist/
+
+# 前端依赖（构建产物 panel/webdist 需要入库，因为它被 go:embed 打进二进制）
+node_modules/

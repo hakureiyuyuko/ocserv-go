@@ -31,6 +31,7 @@ PORT=443
 NET="10.66.66.0/24"
 IP="10.66.66.1"
 DNS="1.1.1.1"
+MTU="1400"
 USERS="/etc/ocserv/ocpasswd"
 CERT=""
 KEY=""
@@ -101,13 +102,16 @@ if [ "$UNINSTALL" = 1 ]; then
   say "卸载 ocserv-go"
   case "$INIT" in
     systemd)
+      systemctl disable --now "$SVC-panel" >/dev/null 2>&1 || true
       systemctl disable --now "$SVC" >/dev/null 2>&1 || true
-      rm -f "/etc/systemd/system/$SVC.service"
+      rm -f "/etc/systemd/system/$SVC.service" "/etc/systemd/system/$SVC-panel.service"
       systemctl daemon-reload || true ;;
     openrc)
+      rc-service "$SVC-panel" stop >/dev/null 2>&1 || true
       rc-service "$SVC" stop >/dev/null 2>&1 || true
+      rc-update del "$SVC-panel" default >/dev/null 2>&1 || true
       rc-update del "$SVC" default >/dev/null 2>&1 || true
-      rm -f "/etc/init.d/$SVC" ;;
+      rm -f "/etc/init.d/$SVC" "/etc/init.d/$SVC-panel" ;;
   esac
   rm -f "$PREFIX/ocserv-go"
   echo "已移除服务与二进制；配置 /etc/ocserv-go、用户库 $USERS、证书均保留"
@@ -194,7 +198,7 @@ fi
 mkdir -p /etc/ocserv-go
 chmod 700 /etc/ocserv-go
 
-ARGS="-addr :$PORT -users $USERS -cert $CERT -key $KEY -net $NET -ip $IP -dns $DNS -domain $DOMAIN"
+ARGS="-addr :$PORT -users $USERS -cert $CERT -key $KEY -net $NET -ip $IP -dns $DNS -mtu $MTU -domain $DOMAIN"
 
 # ---------------------------------------------------------------- 服务单元
 say "服务单元"
@@ -243,6 +247,83 @@ UNIT
     echo "    $PREFIX/ocserv-go $ARGS" ;;
 esac
 
+# ---------------------------------------------------------------- 管理面板
+say "管理面板（内置在同一个二进制里）"
+PANEL_CFG=/etc/ocserv-go/panel.json
+PANEL_PORT="${PANEL_PORT:-19999}"
+mkdir -p /etc/ocserv-go
+if [ ! -f "$PANEL_CFG" ]; then
+  PANEL_PW="$(openssl rand -base64 12 2>/dev/null | tr -dc 'A-Za-z0-9' | cut -c1-12 || true)"
+  [ -n "$PANEL_PW" ] || PANEL_PW="admin123456"
+  cat > "$PANEL_CFG" <<JSON
+{
+  "title": "ocserv-go 管理面板",
+  "listen": ":$PANEL_PORT",
+  "service": "$SVC",
+  "bin": "$PREFIX/ocserv-go",
+  "usersFile": "$USERS",
+  "certFile": "$CERT",
+  "keyFile": "$KEY",
+  "domain": "$DOMAIN",
+  "vpnPort": $PORT,
+  "vpnNet": "$NET",
+  "vpnMtu": $MTU,
+  "vpnDns": ["$(printf '%s' "$DNS" | cut -d, -f1)"]
+}
+JSON
+  chmod 600 "$PANEL_CFG"
+  "$PREFIX/ocserv-go" panel -config "$PANEL_CFG" -set-password "admin:$PANEL_PW" -init >/dev/null 2>&1 \
+    || warn "面板配置初始化失败（可手动：ocserv-go panel -config $PANEL_CFG -set-password admin:新密码 -init）"
+  echo "    面板账号: admin / $PANEL_PW   （请尽快在面板里修改）"
+else
+  echo "    已存在 $PANEL_CFG，保留现有配置与账号"
+fi
+
+case "$INIT" in
+  systemd)
+    cat > "/etc/systemd/system/$SVC-panel.service" <<UNIT
+[Unit]
+Description=ocserv-go panel (built-in)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$PREFIX/ocserv-go panel -config $PANEL_CFG
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    echo "    /etc/systemd/system/$SVC-panel.service"
+    [ "$NO_START" = 1 ] || { systemctl enable --now "$SVC-panel" >/dev/null 2>&1 || warn "面板启动失败，看 journalctl -u $SVC-panel"; } ;;
+  openrc)
+    cat > "/etc/init.d/$SVC-panel" <<UNIT
+#!/sbin/openrc-run
+description="ocserv-go panel (built-in)"
+
+command="$PREFIX/ocserv-go"
+command_args="panel -config $PANEL_CFG"
+command_background=true
+pidfile="/run/$SVC-panel.pid"
+output_log="/var/log/$SVC-panel.log"
+error_log="/var/log/$SVC-panel.log"
+
+depend() {
+    need net
+}
+UNIT
+    chmod 755 "/etc/init.d/$SVC-panel"
+    rc-update add "$SVC-panel" default >/dev/null 2>&1 || true
+    echo "    /etc/init.d/$SVC-panel（已加入 default 运行级）"
+    [ "$NO_START" = 1 ] || { rc-service "$SVC-panel" restart >/dev/null 2>&1 || rc-service "$SVC-panel" start >/dev/null 2>&1 || true; } ;;
+  *)
+    echo "    手动启动: $PREFIX/ocserv-go panel -config $PANEL_CFG" ;;
+esac
+echo "    面板地址: http://<本机IP>:$PANEL_PORT/"
+
 # ---------------------------------------------------------------- 汇总
 say "完成"
 sleep 1
@@ -257,6 +338,7 @@ echo "    用户库: $USERS"
 echo "    证书:   $CERT"
 echo
 echo "  客户端连接: 任意 AnyConnect 兼容客户端 → $DOMAIN:$PORT"
+echo "  管理面板:   http://<本机IP>:$PANEL_PORT/  (systemctl status $SVC-panel)"
 echo
 echo "  换正式证书（内置 Let's Encrypt DNS-01，无需 80 端口）:"
 echo "    cat > /etc/ocserv-go/acme.env <<'EOF'"

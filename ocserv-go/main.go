@@ -199,6 +199,11 @@ func main() {
 		os.Exit(runACMEOnce())
 	}
 
+	// 子命令：内置管理面板
+	if flag.Arg(0) == "panel" {
+		os.Exit(runPanel())
+	}
+
 	// 子命令：哈希
 	if flag.Arg(0) == "hash" {
 		pw := flag.Arg(1)

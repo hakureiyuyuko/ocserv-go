@@ -44,6 +44,13 @@ jobs:
         with:
           go-version-file: ocserv-go/go.mod
 
+      - name: 检查内嵌前端
+        run: |
+          set -euo pipefail
+          [ -s ocserv-go/panel/webdist/index.html ] || {
+            echo "缺少 ocserv-go/panel/webdist（面板前端未构建/未入库）"; exit 1; }
+          ls -l ocserv-go/panel/webdist ocserv-go/panel/webdist/assets
+
       - name: 单元测试
         run: cd ocserv-go && go test ./...
 

@@ -10,10 +10,14 @@
 ## 仓库结构
 
 ```
-ocserv-go/       # Go 服务端源码（main.go、internal/、install.sh、Dockerfile）
-ocserv-panel/    # 管理面板（Node，backend=go）
-.github/         # CI：推 v* tag 自动出双架构包并发布 Release
+ocserv-go/          # Go 服务端源码（main.go、internal/、install.sh、Dockerfile）
+ocserv-go/panel/    # 内置管理面板（Go API + 前端构建产物 webdist/，go:embed 进二进制）
+web/                # 面板前端源码（Vue 3 + Vite）
+.github/            # CI：推 v* tag 自动出双架构包并发布 Release
 ```
+
+> 服务端与面板现在是**同一个二进制**：`ocserv-go` 负责 VPN，`ocserv-go panel`
+> 子命令负责管理面板。运行时不需要 Node.js（Node 只在构建前端时用到）。
 
 ---
 
@@ -299,29 +303,66 @@ ocserv-go -acme-once -acme-domain vpn.example.com -acme-dns cloudflare \
 
 ---
 
-## 管理面板集成
+## 内置管理面板
 
-仓库里的面板（`ocserv-panel/`）支持把这个后端当作一种「运行模式」，在
-`/opt/ocserv-panel/config.json` 里切换：
+面板和 VPN 是同一个二进制，运行时不需要 Node：
+
+```bash
+sudo ocserv-go panel -config /etc/ocserv-go/panel.json     # 默认 :19999
+```
+
+安装脚本会自动完成这些事：生成 `/etc/ocserv-go/panel.json`、建一个 `admin` 账号并打印随机密码、
+写 `ocserv-go-panel.service` 并开机自启。
+
+命令行参数：
+
+| 参数 | 说明 |
+|---|---|
+| `-config` | 配置文件（默认 `/etc/ocserv-go/panel.json`） |
+| `-listen` | 监听地址，覆盖配置 |
+| `-init` | 只生成/保存配置后退出（安装脚本用） |
+| `-set-password user:pw` | 重置面板账号密码 |
+| `-import <旧配置>` | 从旧 Node 面板的 `config.json` 迁移端口/账号/证书路径 |
+
+面板功能：
+
+- **概览**：服务状态、证书剩余天数、用户数、当前监听
+- **VPN 用户**：增删用户、重置密码（写 `ocpasswd`，**改完立即生效**，靠文件热加载）
+- **证书**：查看当前证书、自签、上传 PEM、内置 Let's Encrypt（DNS-01）
+- **服务配置**：域名/端口/网段/MTU/DNS → 重写 systemd 单元并可一键重启
+- **日志**：`journalctl -u ocserv-go`（可自动刷新）
+- **面板设置**：改面板密码、查看路径
+
+配置文件示例（`/etc/ocserv-go/panel.json`，0600）：
 
 ```json
 {
-  "backend": "go",
-  "goBin": "/usr/local/bin/ocserv-go",
-  "goUnit": "ocserv-go",
-  "goMTU": 1400,
-  "goDTLS": true
+  "title": "ocserv-go 管理面板",
+  "listen": ":19999",
+  "service": "ocserv-go",
+  "bin": "/usr/local/bin/ocserv-go",
+  "usersFile": "/etc/ocserv/ocpasswd",
+  "certFile": "/etc/ssl/securev/vpn.example.com/fullchain.pem",
+  "keyFile": "/etc/ssl/securev/vpn.example.com/privkey.pem",
+  "domain": "vpn.example.com",
+  "vpnPort": 443,
+  "vpnNet": "10.66.66.0/24",
+  "vpnMtu": 1400,
+  "vpnDns": ["1.1.1.1"]
 }
 ```
 
-切换后：
+### 前端开发
 
-- 配置向导第 4 步不再写 `ocserv.conf`，而是生成并启动 `/etc/systemd/system/ocserv-go.service`
-- **跳过 NAT 单元**（进程内出网），状态页显示「不需要」
-- 用户管理照旧写 `/etc/ocserv/ocpasswd`，Go 后端直接读（`$5$/$6$` crypt 与 bcrypt）
-- 证书可选「**内置 DNS-01（Go 后端）**」：面板写 `/etc/ocserv-go/acme.env`、调用
-  `ocserv-go -acme-once`、并安装 `acme-renew-builtin.sh`（剩余 <30 天才申请）+ cron
-- 服务启停/状态/日志仍走 systemd（服务名取 `goUnit`）
+前端源码在 `web/`（Vue 3 + Vite）：
+
+```bash
+cd web && npm install
+npm run dev      # 开发：热更新，API 转发到 127.0.0.1:19999
+npm run build    # 产物输出到 ocserv-go/panel/webdist/（已入库，go build 不需要 Node）
+```
+
+构建产物提交进仓库，所以**用发行版的人完全不用装 Node**；只有改前端时才需要 `npm`。
 
 ---
 
@@ -353,7 +394,7 @@ Configured as 10.66.66.2, with SSL connected and DTLS connected
 - **只实现 AnyConnect/ASA 协议**（标准 OpenConnect 协议不在范围内）
 - 无压缩（CSTP 压缩帧未实现）
 - 路由固定全局，不下发 split include/exclude
-- ICMP 只回应隧道内地址，不代理到外网
+- ICMP 由服务端本地代答（ping 任意地址都回，延迟=到网关 RTT；`-icmp-echo=false` 关闭）
 - 出网源地址是运行本进程的机器（上游看到宿主 IP）
 - 认证状态按连接维护，没有会话超时/重新认证策略
 - 无带宽限制、无多用户审计
