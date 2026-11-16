@@ -187,7 +187,7 @@ func TestSanitizeLogonHTML(t *testing.T) {
 			t.Fatalf("脱敏后仍含 %q:\n%s", banned, out)
 		}
 	}
-	for _, keep := range []string{`<select name="tgroup">`, `name="username"`, `name="password"`, "/+webvpn+/index.html"} {
+	for _, keep := range []string{`<select name="tgroup">`, `<option value="HetraVPN_Group" selected>HetraVPN_Group</option>`, `name="username"`, `name="password"`, "/+webvpn+/index.html"} {
 		if !strings.Contains(out, keep) {
 			t.Fatalf("脱敏不应破坏 %q:\n%s", keep, out)
 		}
@@ -212,5 +212,18 @@ func TestExtractSanitizesLogon(t *testing.T) {
 	}
 	if !strings.Contains(string(b), `name="username"`) {
 		t.Fatal("不应影响其它表单字段")
+	}
+}
+
+// 组下拉框里应当只剩一个固定的 HetraVPN_Group，且重复脱敏不会叠加。
+func TestSanitizeFixedGroup(t *testing.T) {
+	in := `<select name="tgroup"><option value="A_Corp">A_Corp</option></select>`
+	once := SanitizeLogonHTML([]byte(in))
+	twice := SanitizeLogonHTML(once)
+	if strings.Count(string(twice), "HetraVPN_Group") != 2 { // value + 文本
+		t.Fatalf("应只有一个固定选项:\n%s", twice)
+	}
+	if strings.Contains(string(twice), "A_Corp") {
+		t.Fatalf("原组名应被清除:\n%s", twice)
 	}
 }

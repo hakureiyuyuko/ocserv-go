@@ -93,8 +93,9 @@ onMounted(load)
     <p class="muted" style="font-size:12px;margin:8px 0 0">
       只要 <code>+CSCOE+</code> / <code>+CSCOU+</code> 下有文件即可；带上 <code>+CSCOE+/logon.html</code>
       会<b>整页替换</b>登录页（表单字段须仍为 username / password，POST 到 /+webvpn+/index.html）。
-      页面里的<b>组名</b>（<code>&lt;option&gt;</code>、<code>group_list</code>）会在上传时自动去掉，
-      不会把你设备的连接组名公开出去。
+      页面里的<b>连接组名</b>会在上传时统一替换成 <code>HetraVPN_Group</code>
+      （原有 <code>&lt;option&gt;</code>、<code>group_list</code> 一并清理），
+      不会把设备上的组名公开出去。
     </p>
   </div>
 

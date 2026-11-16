@@ -385,8 +385,9 @@ tar czf cisco-assets.tar.gz +CSCOE+ +CSCOU+
   POST 到 `/+webvpn+/index.html`，与本套件兼容）；
 - 只接受 `+CSCOT+` / `+CSCOU+` / `+CSCOE+` 下的路径；拒绝绝对路径、`..`、软链、设备文件；
   总量 ≤ 32MB、单文件 ≤ 8MB、文件数 ≤ 500；包里多带的 README/`.DS_Store` 会被忽略；
-- **自动脱敏**：`+CSCOE+/*.html` 里的**组名会被去掉**（删除 `<option>`、`group_list` 隐藏域，
-  并在全文其它位置一并清理），避免把你设备的连接组名公开到登录页上。
+- **自动脱敏**：`+CSCOE+/*.html` 里的**连接组名会被替换成固定的 `HetraVPN_Group`**
+  （删除原有的 `<option>`、`group_list` 隐藏域，并在全文其它位置清理掉原组名），
+  避免把你（或对方）设备的连接组名公开到登录页上。
 
 面板接口：
 

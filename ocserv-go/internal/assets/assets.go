@@ -267,18 +267,22 @@ func ContentType(p string) string {
 
 // ---- 脱敏：登录页里的组名 ----
 
+// GroupName 是登录页里统一展示的连接组名：
+// 上传页面里的真实组名会被替换成它（服务端本来就忽略 tgroup）。
+const GroupName = "HetraVPN_Group"
+
 var (
-	reOption     = regexp.MustCompile(`(?is)<option\b[^>]*>(.*?)</option>`)
-	reOptionVal  = regexp.MustCompile(`(?i)value\s*=\s*["']([^"']*)["']`)
-	reGroupInput = regexp.MustCompile(`(?is)<input\b[^>]*name\s*=\s*["']?group_list["']?[^>]*>`)
+	reSelectGroup = regexp.MustCompile(`(?is)<select\b[^>]*\bname\s*=\s*["']?(?:tgroup|group_list)["']?[^>]*>`)
+	reOption      = regexp.MustCompile(`(?is)<option\b[^>]*>(.*?)</option>`)
+	reOptionVal   = regexp.MustCompile(`(?i)value\s*=\s*["']([^"']*)["']`)
+	reGroupInput  = regexp.MustCompile(`(?is)<input\b[^>]*name\s*=\s*["']?group_list["']?[^>]*>`)
 )
 
-// SanitizeLogonHTML 去掉页面里暴露的「组名」信息。
+// SanitizeLogonHTML 把页面里暴露的「组名」统一替换成 GroupName。
 //
 // Cisco 登录页会把设备上配置的连接组（group）以 <option> 形式写进页面，
 // 传上来就等于把对方（或自己）的内部组名公开到登录页。这里：
-//   - 删除所有 <option>…</option>（组名选项），保留 <select> 本身（值为空，
-//     服务端本来就忽略 tgroup）；
+//   - 删除所有原有 <option>…</option>，只留一个固定的 HetraVPN_Group；
 //   - 删除 group_list 隐藏域；
 //   - 再把从 option 里提取到的组名，在全文其它位置一并清掉（含 URL 转义形式）。
 func SanitizeLogonHTML(b []byte) []byte {
@@ -287,11 +291,11 @@ func SanitizeLogonHTML(b []byte) []byte {
 	// 先收集组名，后面全文清理
 	var names []string
 	for _, m := range reOption.FindAllStringSubmatch(s, -1) {
-		if v := strings.TrimSpace(m[1]); v != "" {
-			names = append(names, html.UnescapeString(v))
+		if v := strings.TrimSpace(html.UnescapeString(m[1])); v != "" && v != GroupName {
+			names = append(names, v)
 		}
 		if vm := reOptionVal.FindStringSubmatch(m[0]); vm != nil {
-			if v := strings.TrimSpace(html.UnescapeString(vm[1])); v != "" {
+			if v := strings.TrimSpace(html.UnescapeString(vm[1])); v != "" && v != GroupName {
 				names = append(names, v)
 			}
 		}
@@ -308,6 +312,10 @@ func SanitizeLogonHTML(b []byte) []byte {
 		s = strings.ReplaceAll(s, n, "")
 		s = strings.ReplaceAll(s, url.PathEscape(n), "")
 	}
+	// 清理完再放固定选项，避免它自己被当成组名清掉
+	s = reSelectGroup.ReplaceAllStringFunc(s, func(m string) string {
+		return m + `<option value="` + GroupName + `" selected>` + GroupName + `</option>`
+	})
 	return []byte(s)
 }
 
