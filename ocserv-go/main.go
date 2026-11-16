@@ -941,9 +941,16 @@ func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 建隧道：直接回裸 HTTP 响应，之后是 CSTP 二进制流
+	// 建隧道：直接回裸 HTTP 响应，之后是 CSTP 二进制流。
+	// 头部按 ocserv（src/worker-vpn.c）的完整集合发 —— 真 AnyConnect 客户端
+	// 少一个（如 Session-Timeout / Keep / License）就会连上后立刻发 DISCONNECT。
+	// 建隧道：直接回裸 HTTP 响应，之后是 CSTP 二进制流。
+	// 头部逐项对照真 ocserv 1.3 的实测响应（同样这些字段真 AnyConnect Android 认）：
+	// 注意 Session-Timeout / Rekey-* 用整数枚举（"none" 会被客户端判为无效配置）。
 	fmt.Fprintf(conn, "HTTP/1.1 200 CONNECTED\r\n")
 	fmt.Fprintf(conn, "X-CSTP-Version: 1\r\n")
+	fmt.Fprintf(conn, "X-CSTP-Server-Name: OpenConnect VPN Server\r\n")
+	fmt.Fprintf(conn, "X-CSTP-DPD: %d\r\n", int(s.dpd.Seconds()))
 	fmt.Fprintf(conn, "X-CSTP-Address: %s\r\n", ip.String())
 	fmt.Fprintf(conn, "X-CSTP-Netmask: %s\r\n", s.netmask())
 	for i, d := range s.dns {
@@ -952,12 +959,19 @@ func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		}
 		fmt.Fprintf(conn, "X-CSTP-DNS: %s\r\n", d)
 	}
-	fmt.Fprintf(conn, "X-CSTP-MTU: %d\r\n", s.mtu)
-	fmt.Fprintf(conn, "X-CSTP-Base-MTU: 1500\r\n")
-	fmt.Fprintf(conn, "X-CSTP-DPD: %d\r\n", int(s.dpd.Seconds()))
-	fmt.Fprintf(conn, "X-CSTP-Keepalive: 30\r\n")
 	fmt.Fprintf(conn, "X-CSTP-Tunnel-All-DNS: true\r\n")
-	fmt.Fprintf(conn, "X-CSTP-Default-Domain: %s\r\n", s.domain)
+	fmt.Fprintf(conn, "X-CSTP-Client-Bypass-Protocol: false\r\n")
+	fmt.Fprintf(conn, "X-CSTP-Keepalive: 30\r\n")
+	fmt.Fprintf(conn, "X-CSTP-Idle-Timeout: none\r\n")
+	fmt.Fprintf(conn, "X-CSTP-Smartcard-Removal-Disconnect: true\r\n")
+	fmt.Fprintf(conn, "X-CSTP-Rekey-Time: 86400\r\n")
+	fmt.Fprintf(conn, "X-CSTP-Rekey-Method: new-tunnel\r\n")
+	fmt.Fprintf(conn, "X-CSTP-Session-Timeout: 0\r\n")
+	fmt.Fprintf(conn, "X-CSTP-Session-Timeout-Remaining: 0\r\n")
+	fmt.Fprintf(conn, "X-CSTP-Disconnected-Timeout: none\r\n")
+	fmt.Fprintf(conn, "X-CSTP-Keep: true\r\n")
+	fmt.Fprintf(conn, "X-CSTP-TCP-Keepalive: true\r\n")
+	fmt.Fprintf(conn, "X-CSTP-License: accept\r\n")
 	if tun != nil {
 		fmt.Fprintf(conn, "X-DTLS-Session-ID: %s\r\n", tun.id)
 		fmt.Fprintf(conn, "X-DTLS-Port: %d\r\n", s.dtlsPort)
@@ -966,6 +980,8 @@ func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(conn, "X-DTLS-MTU: %d\r\n", s.mtu)
 		fmt.Fprintf(conn, "X-DTLS12-CipherSuite: %s\r\n", dtlsx.SuiteNameRSA)
 	}
+	fmt.Fprintf(conn, "X-CSTP-Base-MTU: 1500\r\n")
+	fmt.Fprintf(conn, "X-CSTP-MTU: %d\r\n", s.mtu)
 	fmt.Fprintf(conn, "\r\n")
 
 	log.Printf("隧道建立: 用户=%s 客户端 IP=%s", user, ip)
@@ -1222,7 +1238,11 @@ func (s *server) tunnel(ctx context.Context, conn net.Conn, br *bufio.Reader, us
 					return
 				}
 			case cstp.TypeDisconnect, cstp.TypeTerminate:
-				log.Printf("客户端主动断开: %s", user)
+				reason := strings.TrimRight(string(f.payload), "\x00")
+				if reason == "" {
+					reason = "(无)"
+				}
+				log.Printf("客户端主动断开: %s  原因=%q", user, reason)
 				return
 			default:
 				if *verbose {
