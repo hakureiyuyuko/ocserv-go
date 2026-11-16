@@ -102,8 +102,8 @@ jobs:
             cp LICENSE "$D/LICENSE"
             cp ocserv-go/README.md "$D/README.md" 2>/dev/null || cp README.md "$D/README.md"
             tar czf "dist/ocserv-go-${V}-linux-${ARCH}.tar.gz" -C dist/pkg "ocserv-go-${V}-linux-${ARCH}"
-            tar tzf "dist/ocserv-go-${V}-linux-${ARCH}.tar.gz" | grep -q "bin/ocserv-go" \
-              || { echo "包内没有 bin/ocserv-go"; exit 1; }
+            tar tzf "dist/ocserv-go-${V}-linux-${ARCH}.tar.gz" > /tmp/pkglist.txt
+            grep -q "bin/ocserv-go" /tmp/pkglist.txt || { echo "包内没有 bin/ocserv-go"; exit 1; }
           done
           rm -rf dist/pkg
           ls -l dist
