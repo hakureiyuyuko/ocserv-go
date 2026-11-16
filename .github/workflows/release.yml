@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 解析版本号
+      - name: 解析版本号并识别产品线
         id: ver
         run: |
           set -euo pipefail
@@ -33,21 +33,31 @@ jobs:
           else
             V="${GITHUB_REF_NAME#v}"
           fi
+          # v1.6.x 属于主线套件（install.sh KIT_VERSION），v1.0.0 属于 ocserv-go 分支
+          KIND=""
+          if grep -q "KIT_VERSION=\"$V\"" install.sh; then
+            KIND=kit
+          elif [ -f ocserv-go/install.sh ] && grep -q "^VERSION=\"$V\"" ocserv-go/install.sh; then
+            KIND=go
+          fi
+          if [ -z "$KIND" ]; then
+            echo "版本 $V 与 install.sh 的 KIT_VERSION、ocserv-go/install.sh 的 VERSION 都不匹配"
+            exit 1
+          fi
+          if [ "$KIND" = "kit" ]; then
+            grep -q "VERSION *= *'$V'" ocserv-panel/server.js || { echo "server.js 的 VERSION 不是 $V"; exit 1; }
+            [ -x alpine/install.sh ] || chmod +x alpine/install.sh
+          fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
-          echo "版本: $V"
-
-      - name: 校验版本一致性
-        run: |
-          set -euo pipefail
-          V='${{ steps.ver.outputs.version }}'
-          grep -q "KIT_VERSION=\"$V\"" install.sh || { echo "install.sh 的 KIT_VERSION 不是 $V"; exit 1; }
-          grep -q "VERSION *= *'$V'" ocserv-panel/server.js || { echo "server.js 的 VERSION 不是 $V"; exit 1; }
-          [ -x alpine/install.sh ] || chmod +x alpine/install.sh
+          echo "kind=$KIND" >> "$GITHUB_OUTPUT"
+          echo "版本: $V   产品线: $KIND"
 
       - name: 构建 Alpine 包（自编译 ocserv + 内置 Node）
+        if: steps.ver.outputs.kind == 'kit'
         run: bash alpine/build-package.sh --version '${{ steps.ver.outputs.version }}' --out dist
 
       - name: 构建主线包（不含 docs/ 与 tools/）
+        if: steps.ver.outputs.kind == 'kit'
         run: |
           set -euo pipefail
           V='${{ steps.ver.outputs.version }}'
@@ -57,6 +67,7 @@ jobs:
           rm -rf dist/kit
 
       - name: 冒烟测试（Alpine 包能装能跑）
+        if: steps.ver.outputs.kind == 'kit'
         run: |
           set -euo pipefail
           docker run --rm -v "$PWD/dist:/d:ro" alpine:latest sh -c '
@@ -68,6 +79,44 @@ jobs:
             [ -x "$P/bin/ocserv.real-worker" ] && echo "worker: ok"
             ls "$P/lib" | wc -l
           '
+
+      - uses: actions/setup-go@v5
+        if: steps.ver.outputs.kind == 'go'
+        with:
+          go-version-file: ocserv-go/go.mod
+
+      - name: 构建 ocserv-go 发行包（amd64 / arm64）
+        if: steps.ver.outputs.kind == 'go'
+        run: |
+          set -euo pipefail
+          V='${{ steps.ver.outputs.version }}'
+          mkdir -p dist/pkg
+          for ARCH in amd64 arm64; do
+            D="dist/pkg/ocserv-go-${V}-linux-${ARCH}"
+            mkdir -p "$D/bin"
+            ( cd ocserv-go && GOOS=linux GOARCH="$ARCH" CGO_ENABLED=0 \
+                go build -trimpath -ldflags "-s -w" -o "../../$D/bin/ocserv-go" . )
+            cp ocserv-go/install.sh "$D/install.sh"
+            chmod +x "$D/install.sh"
+            cp LICENSE "$D/LICENSE"
+            cp ocserv-go/README.md "$D/README.md" 2>/dev/null || cp README.md "$D/README.md"
+            tar czf "dist/ocserv-go-${V}-linux-${ARCH}.tar.gz" -C dist/pkg "ocserv-go-${V}-linux-${ARCH}"
+          done
+          rm -rf dist/pkg
+          ls -l dist
+
+      - name: 冒烟测试（ocserv-go：本地架构可执行 + 元数据自检）
+        if: steps.ver.outputs.kind == 'go'
+        run: |
+          set -euo pipefail
+          V='${{ steps.ver.outputs.version }}'
+          rm -rf /tmp/smk && mkdir -p /tmp/smk && cd /tmp/smk
+          tar xzf "$GITHUB_WORKSPACE/dist/ocserv-go-${V}-linux-amd64.tar.gz"
+          P="ocserv-go-${V}-linux-amd64"
+          "$P/bin/ocserv-go" -version | tee /tmp/smk/ver.txt
+          grep -qx "$V" /tmp/smk/ver.txt || { echo "二进制版本不是 $V"; exit 1; }
+          sh -n "$P/install.sh"
+          grep -q 'ocserv-go' "$P/install.sh"
 
       - name: 生成校验和
         run: |
