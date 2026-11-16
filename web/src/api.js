@@ -58,6 +58,7 @@ export const api = {
   },
 
   cert: () => req('GET', '/api/cert'),
+  certProviders: () => req('GET', '/api/cert/providers'),
   selfSigned: (domain) => req('POST', '/api/cert', { action: 'selfsigned', domain }),
   uploadCert: (domain, cert, key) => req('POST', '/api/cert', { action: 'upload', domain, cert, key }),
   acme: (payload) => req('POST', '/api/cert', { action: 'acme', ...payload }),

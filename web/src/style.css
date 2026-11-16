@@ -38,6 +38,8 @@ input, select, textarea {
   background: #fff;
   width: 100%;
 }
+/* checkbox / radio 不要被 input 的 width:100% 拉满 */
+input[type="checkbox"], input[type="radio"] { width: auto; margin: 0 6px 0 0; vertical-align: middle; }
 textarea { min-height: 110px; font-family: ui-monospace, monospace; font-size: 12px; }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }

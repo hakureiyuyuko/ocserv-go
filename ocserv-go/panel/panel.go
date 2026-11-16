@@ -8,12 +8,15 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hakureiyuyuko/ocserv-go/internal/acme"
@@ -58,6 +61,7 @@ func (p *Panel) Handler() http.Handler {
 	mux.HandleFunc("POST /api/assets", p.withAuth(p.handleAssetsUpload))
 	mux.HandleFunc("DELETE /api/assets", p.withAuth(p.handleAssetsClear))
 	mux.HandleFunc("GET /api/cert", p.withAuth(p.handleCertInfo))
+	mux.HandleFunc("GET /api/cert/providers", p.withAuth(p.handleCertProviders))
 	mux.HandleFunc("POST /api/cert", p.withAuth(p.handleCertPost))
 	mux.HandleFunc("GET /api/config", p.withAuth(p.handleConfigGet))
 	mux.HandleFunc("POST /api/config", p.withAuth(p.handleConfigPost))
@@ -274,19 +278,54 @@ func (p *Panel) handleAssetsClear(w http.ResponseWriter, _ *http.Request, _ stri
 
 // ---- 证书 ----
 
+// acmeField 是某个 DNS 服务商需要的凭据字段（写进环境变量，与 lego 约定一致）。
+type acmeField struct {
+	K     string `json:"k"`
+	Label string `json:"label"`
+	Hint  string `json:"hint,omitempty"`
+}
+
+type acmeProvider struct {
+	ID     string      `json:"id"`
+	Name   string      `json:"name"`
+	Fields []acmeField `json:"fields"`
+}
+
+var acmeProviders = []acmeProvider{
+	{"cloudflare", "Cloudflare", []acmeField{
+		{"CF_DNS_API_TOKEN", "API Token", "Zone → DNS → Edit 权限即可，创建时只显示一次"},
+	}},
+	{"alidns", "阿里云 DNS", []acmeField{
+		{"ALICLOUD_ACCESS_KEY", "AccessKey ID", ""},
+		{"ALICLOUD_SECRET_KEY", "AccessKey Secret", ""},
+	}},
+	{"tencentcloud", "腾讯云 DNSPod", []acmeField{
+		{"TENCENTCLOUD_SECRET_ID", "SecretId", ""},
+		{"TENCENTCLOUD_SECRET_KEY", "SecretKey", ""},
+	}},
+	{"dnspod", "DNSPod Token", []acmeField{
+		{"DNSPOD_API_KEY", "ID,Token", "形如 12345,abcdefg…"},
+	}},
+}
+
+func (p *Panel) handleCertProviders(w http.ResponseWriter, _ *http.Request, _ string) {
+	writeJSON(w, http.StatusOK, map[string]any{"providers": acmeProviders, "envFile": p.cfg.AcmeEnv})
+}
+
 func (p *Panel) handleCertInfo(w http.ResponseWriter, _ *http.Request, _ string) {
 	writeJSON(w, http.StatusOK, p.CertInfo())
 }
 
 func (p *Panel) handleCertPost(w http.ResponseWriter, r *http.Request, _ string) {
 	var in struct {
-		Action   string `json:"action"` // selfsigned | upload | acme
-		Domain   string `json:"domain"`
-		Cert     string `json:"cert"`
-		Key      string `json:"key"`
-		Email    string `json:"email"`
-		Provider string `json:"provider"`
-		Staging  bool   `json:"staging"`
+		Action   string            `json:"action"` // selfsigned | upload | acme
+		Domain   string            `json:"domain"`
+		Cert     string            `json:"cert"`
+		Key      string            `json:"key"`
+		Email    string            `json:"email"`
+		Provider string            `json:"provider"`
+		Staging  bool              `json:"staging"`
+		Creds    map[string]string `json:"creds"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		fail(w, http.StatusBadRequest, "请求体不是合法 JSON")
@@ -301,20 +340,24 @@ func (p *Panel) handleCertPost(w http.ResponseWriter, r *http.Request, _ string)
 		return
 	}
 	certDir := certDir(domain)
-	if err := osMkdirAll(certDir); err != nil {
-		fail(w, http.StatusInternalServerError, err.Error())
-		return
-	}
 	certFile := certDir + "/fullchain.pem"
 	keyFile := certDir + "/privkey.pem"
 
 	switch in.Action {
 	case "selfsigned":
+		if err := osMkdirAll(certDir); err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 		if err := selfSigned(domain, certFile, keyFile); err != nil {
 			fail(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 	case "upload":
+		if err := osMkdirAll(certDir); err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 		if !strings.Contains(in.Cert, "BEGIN CERTIFICATE") || !strings.Contains(in.Key, "PRIVATE KEY") {
 			fail(w, http.StatusBadRequest, "证书或私钥不像 PEM")
 			return
@@ -332,12 +375,38 @@ func (p *Panel) handleCertPost(w http.ResponseWriter, r *http.Request, _ string)
 			fail(w, http.StatusBadRequest, "请选择 DNS 服务商")
 			return
 		}
+		var meta *acmeProvider
+		for i := range acmeProviders {
+			if acmeProviders[i].ID == in.Provider {
+				meta = &acmeProviders[i]
+				break
+			}
+		}
+		if meta == nil {
+			fail(w, http.StatusBadRequest, "不支持的 DNS 服务商")
+			return
+		}
+		// 凭据缺失检查（给出具体字段名）
+		var missing []string
+		for _, f := range meta.Fields {
+			if strings.TrimSpace(in.Creds[f.K]) == "" {
+				missing = append(missing, f.K)
+			}
+		}
+		if len(missing) > 0 {
+			fail(w, http.StatusBadRequest, "请填写凭据："+strings.Join(missing, ", "))
+			return
+		}
+		if err := osMkdirAll(certDir); err != nil {
+			fail(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 		defer cancel()
-		certPEM, keyPEM, err := acme.Obtain(ctx, acme.Config{
+		certPEM, keyPEM, err := obtainWithCreds(ctx, p.cfg.AcmeEnv, acme.Config{
 			Domain: domain, Email: in.Email, Provider: in.Provider,
 			CacheDir: "/etc/ocserv-go/acme", Staging: in.Staging, KeyType: "rsa2048",
-		}, func(f string, a ...any) {})
+		}, in.Creds)
 		if err != nil {
 			fail(w, http.StatusBadGateway, "ACME 签发失败: "+err.Error())
 			return
@@ -514,4 +583,70 @@ func dirOf(p string) string {
 		return "."
 	}
 	return p[:i]
+}
+
+// acmeEnvMu 保护临时设置的环境变量（lego 的服务商从环境变量读凭据）。
+var acmeEnvMu sync.Mutex
+
+// obtainWithCreds 把凭据注入环境变量后调用 acme.Obtain，结束后恢复，
+// 并把凭据写入 0600 的 env 文件（供命令行 -acme-once / 续期复用）。
+func obtainWithCreds(ctx context.Context, envFile string, cfg acme.Config, creds map[string]string) ([]byte, []byte, error) {
+	acmeEnvMu.Lock()
+	defer acmeEnvMu.Unlock()
+
+	type saved struct {
+		v   string
+		had bool
+	}
+	old := map[string]saved{}
+	for k, v := range creds {
+		if !validEnvKey(k) {
+			return nil, nil, fmt.Errorf("非法环境变量名: %q", k)
+		}
+		prev, had := os.LookupEnv(k)
+		old[k] = saved{prev, had}
+		_ = os.Setenv(k, strings.TrimSpace(v))
+	}
+	defer func() {
+		for k, s := range old {
+			if s.had {
+				_ = os.Setenv(k, s.v)
+			} else {
+				_ = os.Unsetenv(k)
+			}
+		}
+	}()
+
+	if envFile != "" {
+		var b strings.Builder
+		b.WriteString("# 由面板「证书」页写入；权限 600，勿提交到版本库\n")
+		keys := make([]string, 0, len(creds))
+		for k := range creds {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			b.WriteString(k + "=" + strings.TrimSpace(creds[k]) + "\n")
+		}
+		if err := os.MkdirAll(dirOf(envFile), 0o755); err == nil {
+			_ = os.WriteFile(envFile, []byte(b.String()), 0o600)
+		}
+	}
+
+	return acme.Obtain(ctx, cfg, func(string, ...any) {})
+}
+
+func validEnvKey(k string) bool {
+	if k == "" {
+		return false
+	}
+	for i, r := range k {
+		switch {
+		case r == '_' || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z'):
+		case i > 0 && r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	return true
 }

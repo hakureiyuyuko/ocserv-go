@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, inject } from 'vue'
+import { ref, computed, onMounted, inject } from 'vue'
 import { api } from '../api'
 
 const say = inject('toast')
@@ -7,24 +7,39 @@ const info = ref(null)
 const domain = ref('')
 const mode = ref('selfsigned')
 const upload = ref({ cert: '', key: '' })
-const acmeForm = ref({ email: '', provider: 'cloudflare', staging: false })
+const providers = ref([])
+const acmeForm = ref({ email: '', provider: '', staging: false, creds: {} })
 const busy = ref(false)
 
-const providers = [
-  { id: 'cloudflare', label: 'Cloudflare（CF_DNS_API_TOKEN）' },
-  { id: 'alidns', label: '阿里云 DNS' },
-  { id: 'tencentcloud', label: '腾讯云 DNSPod' },
-  { id: 'dnspod', label: 'DNSPod Token' }
-]
+
 
 async function load() {
   try {
     info.value = await api.cert()
     const c = await api.config()
     domain.value = c.domain || ''
+    const pv = await api.certProviders()
+    providers.value = pv.providers || []
+    envFile.value = pv.envFile || ''
+    if (!acmeForm.value.provider && providers.value.length) {
+      acmeForm.value.provider = providers.value[0].id
+      syncCreds()
+    }
   } catch (e) {
     say(e.message, 'err')
   }
+}
+
+const envFile = ref('')
+
+// 当前选择的服务商需要哪些字段
+const curProvider = computed(() => providers.value.find((p) => p.id === acmeForm.value.provider) || null)
+
+// 切换服务商时，清空旧凭据
+function syncCreds() {
+  const creds = {}
+  for (const f of (curProvider.value?.fields || [])) creds[f.k] = ''
+  acmeForm.value.creds = creds
 }
 
 async function run() {
@@ -38,7 +53,15 @@ async function run() {
       say('已保存上传的证书')
     } else {
       say('正在申请，可能需要 1~2 分钟…', 'warn')
-      await api.acme({ domain: domain.value, ...acmeForm.value })
+      const missing = (curProvider.value?.fields || []).filter((f) => !String(acmeForm.value.creds[f.k] || '').trim())
+      if (missing.length) return say('请填写：' + missing.map((f) => f.label).join('、'), 'warn')
+      await api.acme({
+        domain: domain.value,
+        email: acmeForm.value.email,
+        provider: acmeForm.value.provider,
+        staging: acmeForm.value.staging,
+        creds: acmeForm.value.creds
+      })
       say('证书已签发')
     }
     await load()
@@ -88,17 +111,27 @@ onMounted(load)
     <div v-if="mode === 'acme'">
       <div class="row" style="margin-bottom:8px">
         <label class="muted" style="width:90px">DNS 服务商</label>
-        <select v-model="acmeForm.provider" style="width:280px">
-          <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.label }}</option>
+        <select :value="acmeForm.provider" style="width:280px" @change="acmeForm.provider = $event.target.value; syncCreds()">
+          <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.name }}</option>
         </select>
+      </div>
+      <div class="row" v-for="f in (curProvider ? curProvider.fields : [])" :key="f.k" style="margin-bottom:8px;align-items:flex-start">
+        <label class="muted" style="width:90px;padding-top:6px">{{ f.label }}</label>
+        <div>
+          <input :placeholder="f.k" v-model="acmeForm.creds[f.k]" type="password" style="width:320px" autocomplete="off" />
+          <div v-if="f.hint" class="muted" style="font-size:12px;margin-top:2px">{{ f.hint }}</div>
+        </div>
       </div>
       <div class="row" style="margin-bottom:8px">
         <label class="muted" style="width:90px">账号邮箱</label>
         <input v-model="acmeForm.email" placeholder="可留空" style="width:280px" />
-        <label class="muted" style="margin-left:12px"><input type="checkbox" v-model="acmeForm.staging" /> 用 staging 测试</label>
+      </div>
+      <div class="row" style="margin-bottom:8px">
+        <label class="muted"><input type="checkbox" v-model="acmeForm.staging" /> 用 Let's Encrypt staging 测试</label>
       </div>
       <p class="muted" style="font-size:12px">
-        凭据从环境变量读取（如 <span class="mono">CF_DNS_API_TOKEN</span>）；本机没有环境变量时请用「上传已有证书」。
+        凭据只用于本次签发，并写入 <span class="mono">{{ envFile || '/etc/ocserv-go/acme.env' }}</span>（600）。
+        需要 RSA 证书（DTLS 用），签发的是 2048 位。
       </p>
     </div>
 
