@@ -108,9 +108,9 @@
   <button data-v="wz">配置向导</button>
   <button data-v="us">用户管理</button>
   <button data-v="ss">在线会话</button>
-  <button data-v="op">选项</button>
+  <button data-v="op" id="navOp">选项</button>
   <button data-v="lg">日志</button>
-  <button data-v="cf">配置</button>
+  <button data-v="cf" id="navCf">配置</button>
   <button data-v="ct">证书</button>
   <button data-v="pn">面板设置</button>
 </nav>
@@ -133,7 +133,7 @@
   </section>
 
   <section class="view" id="v-us">
-    <div class="box">
+    <div class="box" id="authBox">
       <h2>认证方式 <span class="muted" id="authCur"></span></h2>
       <div class="row" style="margin-bottom:8px">
         <label class="muted"><input type="radio" name="authm" value="plain"> 本地密码文件</label>
@@ -524,6 +524,10 @@ function authSyncPam() {
   $('#authPam').style.opacity = on ? '1' : '.45';
 }
 async function loadAuth() {
+  // Go 后端只支持本地密码文件（ocpasswd），没有 PAM 分支：整块认证方式选择直接隐藏
+  if (!wzSetup) { try { await checkInit(); } catch (e) {} }
+  if (wzSetup && wzSetup.backend === 'go') { $('#authBox').classList.add('hide'); return; }
+  $('#authBox').classList.remove('hide');
   try {
     const d = await api('/api/auth');
     document.querySelectorAll('input[name=authm]').forEach((r) => { r.checked = (r.value === d.method); });
@@ -702,6 +706,16 @@ async function checkInit() {
         if (isGo && !wzFilled) { radio.checked = true; wzSyncMode(); }
       }
     }
+    // Go 后端没有 ocserv.conf：选项（功能开关）与配置（原始 conf 编辑器）都无处可写，隐藏这两页
+    const isGoB = s.backend === 'go';
+    ['navOp', 'navCf'].forEach((id) => {
+      const b = document.getElementById(id);
+      if (b) b.classList.toggle('hide', isGoB);
+    });
+    if (isGoB) {
+      const onHidden = document.querySelector('main .view.on');
+      if (onHidden && (onHidden.id === 'v-op' || onHidden.id === 'v-cf')) switchView('ov');
+    }
     $('#ovBanner').innerHTML = s.initialized ? '' :
       '<div class="box" style="margin-top:0">' +
       '<h2>尚未初始化</h2>' +
@@ -763,16 +777,21 @@ function wzRenderState() {
   $('#wzState').innerHTML = '<h2>当前状态</h2><table><tbody>' +
     '<tr><th style="width:150px">初始化</th><td>' + (s.initialized ? tag(true, '已完成') : '<span class="tag warn">未完成</span>') + '</td></tr>' +
     '<tr><th>ocserv 服务</th><td>' + tag(svc.active === 'active', svc.active || '-') + ' <span class="muted">' + esc(svc.version || '') + ' · enabled=' + esc(svc.enabled || '-') + '</span></td></tr>' +
-    '<tr><th>ocserv.conf</th><td>' + tag(s.hasConf, s.hasConf ? '已生成' : '尚未生成') + '</td></tr>' +
+    // Go 后端没有 ocserv.conf，这一行对它是噪声
+    (s.backend === 'go' ? '' :
+    '<tr><th>ocserv.conf</th><td>' + tag(s.hasConf, s.hasConf ? '已生成' : '尚未生成') + '</td></tr>') +
     '<tr><th>证书</th><td>' + tag(c.exists, c.exists ? ((c.subject || '') + ' · 剩余 ' + (c.daysLeft === undefined ? '-' : c.daysLeft) + ' 天') : '尚未安装') + '</td></tr>' +
     '<tr><th>运行后端</th><td>' + (s.backend === 'go' ? 'ocserv-go（用户态网络栈，无需 tun/特权）' : 'ocserv（系统 C 版）') + '</td></tr>' +
     '<tr><th>NAT 转发单元</th><td>' + (s.backend === 'go' ? '<span class="muted">不需要（Go 后端进程内出网）</span>' : tag(s.hasNAT, s.hasNAT ? ('已安装' + (s.natActive === 'active' ? ' · 运行中' : ' · 未运行')) : '尚未安装')) + '</td></tr>' +
-    '<tr><th>acme.sh</th><td>' + tag(s.acmeInstalled, s.acmeInstalled ? '已安装' : '尚未安装（第 2 步会自动下载）') + '</td></tr>' +
-    '<tr><th>配置模板</th><td>' + tag(s.templates && s.templates.ok, (s.templates && s.templates.ok) ? '就绪' : ('缺失 ' + ((s.templates || {}).dir || ''))) + '</td></tr>' +
+    '<tr><th>acme.sh</th><td>' + (s.backend === 'go' ? '<span class="muted">不使用（内置 lego / 上传 / 自签）</span>' : tag(s.acmeInstalled, s.acmeInstalled ? '已安装' : '尚未安装（第 2 步会自动下载）')) + '</td></tr>' +
+    (s.backend === 'go' ? '' :
+    '<tr><th>配置模板</th><td>' + tag(s.templates && s.templates.ok, (s.templates && s.templates.ok) ? '就绪' : ('缺失 ' + ((s.templates || {}).dir || ''))) + '</td></tr>') +
     '<tr><th>出口网卡</th><td>' + esc(s.outIf || '-') + '</td></tr>' +
     '<tr><th>面板</th><td>' + esc(((s.panel || {}).host || '') + ':' + ((s.panel || {}).port || '')) + '</td></tr>' +
     '</tbody></table>' +
-    (s.initialized ? '<div class="muted" style="margin-top:10px">已初始化。重新执行第 4 步会覆盖 ocserv.conf（覆盖前自动备份）并重启 ocserv。</div>' : '');
+    (s.initialized ? '<div class="muted" style="margin-top:10px">已初始化。' + (s.backend === 'go'
+      ? '重新执行第 4 步会重新生成 systemd 单元并重启 ocserv-go。'
+      : '重新执行第 4 步会覆盖 ocserv.conf（覆盖前自动备份）并重启 ocserv。') + '</div>' : '');
 }
 function genPass() {
   const a = new Uint8Array(12); crypto.getRandomValues(a);
