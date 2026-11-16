@@ -46,3 +46,36 @@ func TestLoadOcpasswdSHA256(t *testing.T) {
 		t.Fatal("错误密码不应通过")
 	}
 }
+
+func TestHotReloadAfterEdit(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "ocpasswd")
+	if err := os.WriteFile(f, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	u, err := Load(f)
+	if err != nil {
+		t.Fatalf("空文件应能加载: %v", err)
+	}
+	if u.Len() != 0 {
+		t.Fatalf("空文件用户数应为 0，得到 %d", u.Len())
+	}
+	// 模拟面板加用户：只改文件，不重启服务
+	h, err := Hash("pw123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f, []byte("bob:*:"+h+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if !u.Verify("bob", "pw123456") {
+		t.Fatal("文件改动后应自动热加载，bob 应能登录")
+	}
+	// 再删掉，验证删除也被感知
+	if err := os.WriteFile(f, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if u.Verify("bob", "pw123456") {
+		t.Fatal("用户删除后不应还能登录")
+	}
+}

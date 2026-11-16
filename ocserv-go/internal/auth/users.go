@@ -11,8 +11,11 @@ import (
 	"bufio"
 	"crypto/subtle"
 	"fmt"
+	"log"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/GehirnInc/crypt"
 	_ "github.com/GehirnInc/crypt/sha256_crypt"
@@ -20,20 +23,76 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// Users 是一份内存中的用户库。
+// Users 是一份内存中的用户库。文件被改写（面板增删用户 / 手工 编辑）后
+// 会在下次校验时自动重新加载，不需要重启服务。
 type Users struct {
-	m map[string]string // username → bcrypt hash
+	mu   sync.RWMutex
+	path string
+	m    map[string]string // username → 哈希
+	mod  time.Time
+	size int64
 }
 
 // Load 读取用户文件。行首 # 与空行会被忽略。
 func Load(path string) (*Users, error) {
+	u := &Users{path: path}
+	if err := u.reload(); err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+// reload 解析整个文件并替换内存里的表。
+func (u *Users) reload() error {
+	m, err := parseFile(u.path)
+	if err != nil {
+		return err
+	}
+	st, statErr := os.Stat(u.path)
+	u.mu.Lock()
+	u.m = m
+	if statErr == nil {
+		u.mod, u.size = st.ModTime(), st.Size()
+	}
+	u.mu.Unlock()
+	return nil
+}
+
+// checkReload 发现文件 mtime/大小变了就重新加载；解析失败时保留旧表（不把服务搞崩）。
+func (u *Users) checkReload() {
+	if u == nil || u.path == "" {
+		return
+	}
+	st, err := os.Stat(u.path)
+	if err != nil {
+		return
+	}
+	u.mu.RLock()
+	same := st.ModTime().Equal(u.mod) && st.Size() == u.size
+	u.mu.RUnlock()
+	if same {
+		return
+	}
+	m, err := parseFile(u.path)
+	if err != nil {
+		log.Printf("用户库 %s 改动后解析失败（继续用旧表）: %v", u.path, err)
+		return
+	}
+	u.mu.Lock()
+	u.m, u.mod, u.size = m, st.ModTime(), st.Size()
+	n := len(m)
+	u.mu.Unlock()
+	log.Printf("用户库已重新加载: %s（%d 个用户）", u.path, n)
+}
+
+func parseFile(path string) (map[string]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	u := &Users{m: make(map[string]string)}
+	m := make(map[string]string)
 	sc := bufio.NewScanner(f)
 	line := 0
 	for sc.Scan() {
@@ -61,22 +120,30 @@ func Load(path string) (*Users, error) {
 		if !isSupportedHash(hash) {
 			return nil, fmt.Errorf("%s:%d: %q 的密码哈希不受支持（支持 bcrypt $2x$ 与 crypt $5$/$6$/$1$）", path, line, name)
 		}
-		u.m[name] = hash
+		m[name] = hash
 	}
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}
 	// 空用户库不算错误：跟 ocserv 一样照常启动，只是所有登录都会被拒绝。
 	// （面板向导允许先配证书/服务、后加用户；若这里 fatal 就会变成 systemd 无限重启）
-	return u, nil
+	return m, nil
 }
 
 // Len 返回用户数，供启动时提示用。
-func (u *Users) Len() int { return len(u.m) }
+func (u *Users) Len() int {
+	u.checkReload()
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	return len(u.m)
+}
 
 // Verify 校验用户名与密码。即使用户名不存在也会跑一次 bcrypt，避免用时差探测用户。
 func (u *Users) Verify(name, pass string) bool {
+	u.checkReload()
+	u.mu.RLock()
 	hash, ok := u.m[name]
+	u.mu.RUnlock()
 	if !ok {
 		// 固定的假哈希，保证耗时接近
 		_ = verifyHash("$2a$10$C6UzMDM.H6dfI/f/IKcEeO5r1o9Q3g5n8x7y6z5w4v3u2t1s0r9p8", pass)
@@ -108,12 +175,18 @@ func verifyHash(hash, pass string) bool {
 
 // Has 判断用户是否存在。
 func (u *Users) Has(name string) bool {
+	u.checkReload()
+	u.mu.RLock()
+	defer u.mu.RUnlock()
 	_, ok := u.m[name]
 	return ok
 }
 
 // Names 返回用户名列表（日志用）。
 func (u *Users) Names() []string {
+	u.checkReload()
+	u.mu.RLock()
+	defer u.mu.RUnlock()
 	out := make([]string, 0, len(u.m))
 	for k := range u.m {
 		out = append(out, k)
