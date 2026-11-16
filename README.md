@@ -4,8 +4,8 @@
 数据面换成 **gVisor 用户态 TCP/IP 栈** —— 所以**不需要 `/dev/net/tun`、不需要 `NET_ADMIN`、
 不需要 `iptables` / `ip_forward`**，无特权 LXC / Docker / PaaS 里都能跑。
 
-> 当前版本 **1.1.2**。本仓库只包含 Go 版服务端与管理面板；
-> C 版 ocserv 部署套件在另一个仓库：[ocserv-deploy-kit](https://github.com/hakureiyuyuko/ocserv-deploy-kit)。
+> 当前版本 **1.1.2**。这是一个**完整的独立实现**：Go 服务端 + 内置管理面板 + 安装脚本 +
+> Docker 镜像，运行时不依赖 C 版 ocserv，也不需要 Node.js。
 
 ## 仓库结构
 
@@ -14,7 +14,7 @@ ocserv-go/          # Go 服务端源码（main.go、internal/、install.sh、Do
 docker-compose.yml  # 容器部署示例（数据挂到 ./data/）
 ocserv-go/panel/    # 内置管理面板（Go API + 前端构建产物 webdist/，go:embed 进二进制）
 web/                # 面板前端源码（Vue 3 + Vite）
-.github/            # CI：推 v* tag 自动出双架构包并发布 Release
+.github/            # CI：推 v* tag 自动出双架构发行包、发布 Release 并推送 GHCR 镜像
 ```
 
 > 服务端与面板现在是**同一个二进制**：`ocserv-go` 负责 VPN，`ocserv-go panel`
@@ -48,15 +48,17 @@ ocserv-go
 
 每个客户端连接独享一个用户态栈，地址按连接从池里分配。
 
-## 和其它实现的关系
+## 和传统 ocserv（内核 TUN 方案）的区别
 
-| | 本分支 `ocserv-go` | `main` 分支 |
+协议层是兼容的（AnyConnect/ASA 客户端不用改），实现完全独立，不共享代码、配置或服务脚本：
+
+| | ocserv-go | 传统 ocserv（C 版） |
 |---|---|---|
-| 服务端 | Go 重写（`ocserv-go/`） | C 版 ocserv（发行版包） |
-| 数据面 | gVisor 用户态栈，进程内出网 | 内核 TUN + iptables NAT |
-| 权限 | **无要求**（能监听端口即可） | 需要 tun / `NET_ADMIN` |
-| 面板 | 可切换后端（`backend=go`） | 原生后端 |
-| 协议 | AnyConnect / ASA（CSTP + DTLS） | 同（另有标准 OpenConnect 协议） |
+| 数据面 | gVisor 用户态栈，进程内直接 `net.Dial` 出网 | 内核 TUN + iptables NAT |
+| 权限 | **无要求**（能监听端口即可） | 需要 `/dev/net/tun`、`NET_ADMIN`、`ip_forward` |
+| 部署 | 单二进制 + 内置面板；systemd / OpenRC / Docker 都自带支持 | 发行版包 + 配置模板 + PAM 等系统依赖 |
+| 管理面板 | 内嵌在同一个二进制里（Vue 前端 `go:embed`） | 需要另装（如 occtl/cockpit 或第三方面板） |
+| 协议范围 | 只做 AnyConnect / ASA（CSTP + DTLS） | AnyConnect 与标准 OpenConnect 协议 |
 
 ---
 
@@ -448,7 +450,7 @@ sudo ocserv-go panel -config /etc/ocserv-go/panel.json     # 默认 :19999
 
 ### 登录页外观（素材由用户自己提供）
 
-套件**不自带**任何 Cisco 图片 / CSS（厂商素材，不随仓库分发）。想还原手上设备的外观，
+本项目**不自带**任何 Cisco 图片 / CSS（厂商素材，不随仓库分发）。想还原手上设备的外观，
 可以自己从设备抓取后打包上传：
 
 ```bash
@@ -475,7 +477,7 @@ tar czf cisco-assets.tar.gz +CSCOE+ +CSCOU+
 - 登录页抬头 Banner 靠 `+CSCOU+/login-header-*.jpg` + `+CSCOU+/gradient.gif`（真机页面里写作
   `gradient.gif?r=255&g=255&b=255`，抓取要带 query，存成 `gradient.gif` 即可）；
 - 如果包里有 `+CSCOE+/logon.html`，**整页替换**登录页（表单字段仍需 `username` / `password`，
-  POST 到 `/+webvpn+/index.html`，与本套件兼容）；
+  POST 到 `/+webvpn+/index.html`，与本项目兼容）；
 - 只接受 `+CSCOT+` / `+CSCOU+` / `+CSCOE+` 下的路径；拒绝绝对路径、`..`、软链、设备文件；
   总量 ≤ 32MB、单文件 ≤ 8MB、文件数 ≤ 500；包里多带的 README/`.DS_Store` 会被忽略；
 - **自动脱敏**：`+CSCOE+/*.html` 里的**连接组名会被替换成固定的 `HetraVPN_Group`**
@@ -543,6 +545,15 @@ Configured as 10.66.66.2, with SSL connected and DTLS connected
 
 连接持续 20 秒无重连；以 `nobody` 用户启动也能正常服务（验证无特权）。
 
+部署方式也逐项跑过：
+
+- **systemd**（Debian 系）与 **OpenRC**（Alpine 3.24，含新版面板的 `rc-service` 服务控制、
+  `/var/log/ocserv-go.log` 日志页、设置页保存并重启）——都是 `install.sh` 装完即可用
+- **Docker**：Alpine 最小镜像（约 25 MB，`CGO_ENABLED=0`），面板托管模式启停 VPN，
+  TCP+UDP 443 与面板端口都实测，`docker stop` 优雅退出
+- 真机协议探针：`init → auth-request`、`/auth → complete`（带 `&sh:`）、`CONNECT 200`、
+  隧道内 ICMP echo 应答，每版发版前复测
+
 ## 已知限制
 
 - **仅 IPv4**；IPv6 包丢弃
@@ -587,4 +598,4 @@ ocserv-go/
 
 ## 许可
 
-[AGPL-3.0-or-later](LICENSE)（与主仓库一致）。
+[AGPL-3.0-or-later](LICENSE)。
