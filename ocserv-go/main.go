@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"flag"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +33,7 @@ import (
 	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/asa"
 	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/auth"
 	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/cstp"
+	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/dtlsx"
 	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/ippool"
 	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/usrnet"
 )
@@ -50,6 +53,8 @@ var (
 	domain     = flag.String("domain", "ocserv-go.local", "自签证书/默认域使用的域名")
 	style      = flag.String("style", "asa", "登录协议风格: asa（模拟 Cisco ASA）或 ocserv")
 	httpOnly   = flag.Bool("http", false, "仅用于预览 Web 页面：用明文 HTTP 启动（真实客户端必须用 TLS）")
+	dtlsOn     = flag.Bool("dtls", true, "启用 DTLS（UDP 数据面，与 TCP 同端口）")
+	dtlsPort   = flag.Int("dtls-port", 0, "DTLS 端口（默认与 -addr 相同）")
 	verbose    = flag.Bool("v", false, "详细日志")
 )
 
@@ -89,6 +94,18 @@ type server struct {
 
 	tokensMu sync.Mutex
 	tokens   map[string]string // webvpn cookie → 用户名
+
+	dtlsWant bool
+	dtlsLn   *dtlsx.Listener
+	dtlsPort int
+	tunMu    sync.Mutex
+	tunnels  map[string]*tunnel // 客户端 IP → 隧道
+}
+
+// tunnel 是一条已建立的 CSTP 隧道（TCP 控制 + 可选 DTLS 数据面）。
+type tunnel struct {
+	id     string
+	dtlsCh chan net.Conn
 }
 
 // serverConfig 是 newServer 的入参（便于测试直接构造）。
@@ -101,6 +118,9 @@ type serverConfig struct {
 	DNS       []string
 	Domain    string
 	Style     string
+	Addr      string
+	DTLS      bool
+	DTLSPort  int
 	Dial      usrnet.DialFunc
 }
 
@@ -126,6 +146,14 @@ func newServer(c serverConfig) (*server, error) {
 		style:    c.Style,
 		start:    time.Now(),
 		tokens:   make(map[string]string),
+		tunnels:  make(map[string]*tunnel),
+		dtlsWant: c.DTLS,
+		dtlsPort: c.DTLSPort,
+	}
+	if s.dtlsPort == 0 {
+		if _, ps, err := net.SplitHostPort(c.Addr); err == nil {
+			s.dtlsPort, _ = strconv.Atoi(ps)
+		}
 	}
 	if c.Dial == nil {
 		d := &net.Dialer{}
@@ -172,6 +200,9 @@ func main() {
 		DNS:       splitCSV(*dnsStr),
 		Domain:    *domain,
 		Style:     *style,
+		Addr:      *addr,
+		DTLS:      *dtlsOn && !*httpOnly,
+		DTLSPort:  *dtlsPort,
 		Dial:      buildDialer(*socksAddr),
 	})
 	if err != nil {
@@ -183,6 +214,24 @@ func main() {
 		tlsCfg, err = tlsConfig()
 		if err != nil {
 			log.Fatalf("TLS 配置失败: %v", err)
+		}
+	}
+
+	// DTLS 监听（与 TCP 同端口，UDP）。
+	// Cisco 的 DTLS 用 ECDHE-RSA 套件，证书必须是 RSA（真机也是）。
+	if s.dtlsEnabled() {
+		cert := tlsCfg.Certificates[0]
+		if !certIsRSA(cert) {
+			log.Printf("!! 当前证书不是 RSA，Cisco 风格 DTLS 需要 RSA 证书，DTLS 已禁用")
+		} else {
+			ln, derr := dtlsx.Listen(fmt.Sprintf(":%d", s.dtlsPort), cert, s.mtu, dtlsx.NewStore())
+			if derr != nil {
+				log.Printf("!! DTLS 启动失败（将只用 TCP）: %v", derr)
+			} else {
+				s.dtlsLn = ln
+				go s.dtlsAcceptLoop()
+				log.Printf("DTLS 监听: udp :%d", s.dtlsPort)
+			}
 		}
 	}
 
@@ -639,6 +688,40 @@ func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
+	// DTLS：客户端在 CONNECT 里用 X-DTLS-Master-Secret 给出 48 字节主密钥，
+	// 双方据此做「恢复握手」。没有该头就只走 TCP。
+	var tun *tunnel
+	if s.dtlsEnabled() && s.dtlsLn != nil {
+		secret, derr := hex.DecodeString(strings.TrimSpace(r.Header.Get("X-DTLS-Master-Secret")))
+		if derr == nil && len(secret) == 48 {
+			idRaw := make([]byte, 32)
+			if _, err := rand.Read(idRaw); err == nil {
+				if serr := s.dtlsLn.Seed(idRaw, secret, dtlsx.SuiteRSA); serr != nil {
+					log.Printf("DTLS 会话预置失败: %v", serr)
+				} else {
+					tun = &tunnel{id: hex.EncodeToString(idRaw), dtlsCh: make(chan net.Conn, 1)}
+				}
+			}
+		} else if *verbose {
+			log.Printf("CONNECT 未带有效的 X-DTLS-Master-Secret，不启用 DTLS")
+		}
+		if tun != nil {
+			if peer, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+				pip := peer.IP.String()
+				s.tunMu.Lock()
+				s.tunnels[pip] = tun
+				s.tunMu.Unlock()
+				defer func() {
+					s.tunMu.Lock()
+					if s.tunnels[pip] == tun {
+						delete(s.tunnels, pip)
+					}
+					s.tunMu.Unlock()
+				}()
+			}
+		}
+	}
+
 	// 建隧道：直接回裸 HTTP 响应，之后是 CSTP 二进制流
 	fmt.Fprintf(conn, "HTTP/1.1 200 CONNECTED\r\n")
 	fmt.Fprintf(conn, "X-CSTP-Version: 1\r\n")
@@ -656,12 +739,65 @@ func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(conn, "X-CSTP-Keepalive: 30\r\n")
 	fmt.Fprintf(conn, "X-CSTP-Tunnel-All-DNS: true\r\n")
 	fmt.Fprintf(conn, "X-CSTP-Default-Domain: %s\r\n", s.domain)
+	if tun != nil {
+		fmt.Fprintf(conn, "X-DTLS-Session-ID: %s\r\n", tun.id)
+		fmt.Fprintf(conn, "X-DTLS-Port: %d\r\n", s.dtlsPort)
+		fmt.Fprintf(conn, "X-DTLS-12: 1\r\n")
+		fmt.Fprintf(conn, "X-DTLS-DPD: %d\r\n", int(s.dpd.Seconds()))
+		fmt.Fprintf(conn, "X-DTLS-MTU: %d\r\n", s.mtu)
+		fmt.Fprintf(conn, "X-DTLS12-CipherSuite: %s\r\n", dtlsx.SuiteNameRSA)
+	}
 	fmt.Fprintf(conn, "\r\n")
 
 	log.Printf("隧道建立: 用户=%s 客户端 IP=%s", user, ip)
 	defer log.Printf("隧道断开: 用户=%s 客户端 IP=%s", user, ip)
 
-	s.tunnel(r.Context(), conn, brw.Reader, user, ip)
+	s.tunnel(r.Context(), conn, brw.Reader, user, ip, tun)
+}
+
+func (s *server) dtlsEnabled() bool { return s.dtlsWant }
+
+// certIsRSA 判断证书公钥是不是 RSA（Cisco 风格 DTLS 用 ECDHE-RSA 套件）。
+func certIsRSA(c tls.Certificate) bool {
+	if c.Leaf != nil {
+		return c.Leaf.PublicKeyAlgorithm == x509.RSA
+	}
+	if len(c.Certificate) == 0 {
+		return false
+	}
+	leaf, err := x509.ParseCertificate(c.Certificate[0])
+	return err == nil && leaf.PublicKeyAlgorithm == x509.RSA
+}
+
+// dtlsAcceptLoop 接受 DTLS 连接，并按客户端 IP 挂到对应隧道上。
+func (s *server) dtlsAcceptLoop() {
+	for {
+		c, err := s.dtlsLn.Accept()
+		if err != nil {
+			return
+		}
+		ip := ""
+		if a, ok := c.RemoteAddr().(*net.UDPAddr); ok {
+			ip = a.IP.String()
+		}
+		s.attachDTLS(ip, c)
+	}
+}
+
+func (s *server) attachDTLS(ip string, c net.Conn) {
+	s.tunMu.Lock()
+	t := s.tunnels[ip]
+	s.tunMu.Unlock()
+	if t == nil {
+		log.Printf("DTLS 连接没有对应隧道（%s），关闭", ip)
+		_ = c.Close()
+		return
+	}
+	select {
+	case t.dtlsCh <- c:
+	default:
+		_ = c.Close()
+	}
 }
 
 func (s *server) netmask() string {
@@ -676,9 +812,10 @@ func (s *server) netmask() string {
 type frame struct {
 	typ     cstp.Type
 	payload []byte
+	viaDTLS bool // 是否强制走 DTLS（DPD 需在同一传输上回）
 }
 
-func (s *server) tunnel(ctx context.Context, conn net.Conn, br *bufio.Reader, user string, ip net.IP) {
+func (s *server) tunnel(ctx context.Context, conn net.Conn, br *bufio.Reader, user string, ip net.IP, tun *tunnel) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -694,11 +831,113 @@ func (s *server) tunnel(ctx context.Context, conn net.Conn, br *bufio.Reader, us
 	}
 	defer st.Close()
 
-	// 所有写操作串行化，避免帧交错
+	// 收到的帧（TCP 与 DTLS 两个来源汇到同一个 channel）
+	type inFrame struct {
+		typ     cstp.Type
+		payload []byte
+		viaDTLS bool
+	}
+	in := make(chan inFrame, 256)
+
+	// TCP 控制通道
+	go func() {
+		for {
+			typ, payload, err := cstp.ReadFrame(br)
+			if err != nil {
+				if *verbose {
+					log.Printf("CSTP 读取结束: %v", err)
+				}
+				cancel()
+				return
+			}
+			select {
+			case in <- inFrame{typ, payload, false}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// DTLS 数据面：等待客户端连上来，然后并行读帧
+	var dtlsMu sync.Mutex
+	var dtlsConn net.Conn
+	if tun != nil {
+		go func() {
+			select {
+			case c := <-tun.dtlsCh:
+				dtlsMu.Lock()
+				dtlsConn = c
+				dtlsMu.Unlock()
+				log.Printf("DTLS 数据面已建立: 用户=%s 客户端=%s", user, ip)
+				// DTLS 是数据报：格式为 [1 字节类型][负载]，不是 8 字节 CSTP 头
+				dbuf := make([]byte, 65536)
+				for {
+					n, rerr := c.Read(dbuf)
+					var typ cstp.Type
+					var payload []byte
+					if rerr == nil && n > 0 {
+						if t, pl, perr := cstp.ParseDTLS(dbuf[:n]); perr == nil {
+							typ, payload = t, append([]byte(nil), pl...)
+						}
+						if *verbose {
+							log.Printf("DTLS 收到: 类型=%d 长度=%d", typ, n-1)
+						}
+					}
+					err := rerr
+					if err != nil {
+						dtlsMu.Lock()
+						if dtlsConn == c {
+							dtlsConn = nil
+						}
+						dtlsMu.Unlock()
+						_ = c.Close()
+						log.Printf("DTLS 连接结束（回落到 TCP）: %v", err)
+						return
+					}
+					select {
+					case in <- inFrame{typ, payload, true}:
+					case <-ctx.Done():
+						return
+					}
+				}
+			case <-ctx.Done():
+			}
+		}()
+	}
+
+	// 所有写操作串行化；DATA 优先走 DTLS，其余（控制帧）走 TCP
 	writes := make(chan frame, 512)
 	go func() {
 		for f := range writes {
-			if err := cstp.WriteFrame(conn, f.typ, f.payload); err != nil {
+			target := conn
+			wantDTLS := f.viaDTLS || f.typ == cstp.TypeData
+			if wantDTLS {
+				dtlsMu.Lock()
+				if dtlsConn != nil {
+					target = dtlsConn
+				}
+				dtlsMu.Unlock()
+			}
+			var werr error
+			if target != conn {
+				if *verbose {
+					log.Printf("DTLS 发送: 类型=%d 长度=%d", f.typ, len(f.payload))
+				}
+				werr = cstp.WriteDTLS(target, f.typ, f.payload)
+			} else {
+				werr = cstp.WriteFrame(target, f.typ, f.payload)
+			}
+			if err := werr; err != nil {
+				if target != conn {
+					// DTLS 写失败：丢弃这帧并回落到 TCP
+					dtlsMu.Lock()
+					if dtlsConn == target {
+						_ = dtlsConn.Close()
+						dtlsConn = nil
+					}
+					dtlsMu.Unlock()
+					continue
+				}
 				cancel()
 				return
 			}
@@ -710,14 +949,14 @@ func (s *server) tunnel(ctx context.Context, conn net.Conn, br *bufio.Reader, us
 	go func() {
 		for b := range st.Outbound() {
 			select {
-			case writes <- frame{cstp.TypeData, b}:
+			case writes <- frame{cstp.TypeData, b, false}:
 			case <-ctx.Done():
 				return
 			}
 		}
 	}()
 
-	// 保活：定期发 DPD 请求
+	// 保活：定期发 DPD 请求（走 TCP 控制通道）
 	go func() {
 		if s.dpd <= 0 {
 			return
@@ -728,7 +967,7 @@ func (s *server) tunnel(ctx context.Context, conn net.Conn, br *bufio.Reader, us
 			select {
 			case <-t.C:
 				select {
-				case writes <- frame{cstp.TypeDPDReq, nil}:
+				case writes <- frame{cstp.TypeDPDReq, nil, false}:
 				case <-ctx.Done():
 					return
 				}
@@ -739,37 +978,40 @@ func (s *server) tunnel(ctx context.Context, conn net.Conn, br *bufio.Reader, us
 	}()
 
 	for {
-		typ, payload, err := cstp.ReadFrame(br)
-		if err != nil {
-			if *verbose {
-				log.Printf("CSTP 读取结束: %v", err)
-			}
-			return
-		}
-		switch typ {
-		case cstp.TypeData:
-			if err := st.Inject(payload); err != nil && *verbose {
-				log.Printf("注入失败: %v", err)
-			}
-		case cstp.TypeDPDReq:
-			select {
-			case writes <- frame{cstp.TypeDPDResp, nil}:
-			case <-ctx.Done():
+		select {
+		case f := <-in:
+			switch f.typ {
+			case cstp.TypeData:
+				if err := st.Inject(f.payload); err != nil && *verbose {
+					log.Printf("注入失败: %v", err)
+				}
+			case cstp.TypeDPDReq:
+				// DTLS 上的 DPD 常用于 MTU 探测：必须回同样长度（type 4）
+				var resp []byte
+				if f.viaDTLS && len(f.payload) > 0 {
+					resp = make([]byte, len(f.payload))
+				}
+				select {
+				case writes <- frame{cstp.TypeDPDResp, resp, f.viaDTLS}:
+				case <-ctx.Done():
+					return
+				}
+			case cstp.TypeKeepalive:
+				select {
+				case writes <- frame{cstp.TypeKeepalive, nil, false}:
+				case <-ctx.Done():
+					return
+				}
+			case cstp.TypeDisconnect, cstp.TypeTerminate:
+				log.Printf("客户端主动断开: %s", user)
 				return
+			default:
+				if *verbose {
+					log.Printf("忽略帧类型 %s（%d 字节）", f.typ, len(f.payload))
+				}
 			}
-		case cstp.TypeKeepalive:
-			select {
-			case writes <- frame{cstp.TypeKeepalive, nil}:
-			case <-ctx.Done():
-				return
-			}
-		case cstp.TypeDisconnect, cstp.TypeTerminate:
-			log.Printf("客户端主动断开: %s", user)
+		case <-ctx.Done():
 			return
-		default:
-			if *verbose {
-				log.Printf("忽略帧类型 %s（%d 字节）", typ, len(payload))
-			}
 		}
 	}
 }

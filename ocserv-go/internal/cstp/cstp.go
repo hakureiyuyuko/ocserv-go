@@ -1,13 +1,14 @@
 // Package cstp 实现 Cisco SSL VPN 的 CSTP 分帧。
 //
-// 隧道建立后（HTTP 200 CONNECTED），双方都用 8 字节头 + 负载的帧：
+// TCP 上的帧头固定 8 字节（与 openconnect 的 cstp.c 一致）：
 //
-//	字节 0     : STF，固定 0x01
-//	字节 1-2   : 负载长度（大端 16 位）
-//	字节 3     : 类型
-//	字节 4-7   : 保留（0）
+//	0000  Magic "STF\x01"
+//	0004  大端 16 位负载长度（不含 8 字节头）
+//	0006  包类型（见下方常量）
+//	0007  必须为 0
+//	0008  负载（通常是一个完整 IP 包）
 //
-// 类型 0 的负载是一个完整的 IP 包（客户端 ↔ 服务端）。
+// DTLS 上不用这个头，而是 1 字节类型 + 负载（见 WriteDTLS/ReadDTLS）。
 package cstp
 
 import (
@@ -20,20 +21,25 @@ import (
 // HeaderLen 是 CSTP 头长度。
 const HeaderLen = 8
 
-// STF 是头首字节的固定值。
-const STF = 0x01
+// 魔数 "STF" 与版本号。
+const (
+	magic0      = 'S'
+	magic1      = 'T'
+	magic2      = 'F'
+	versionByte = 0x01
+)
 
-// Type 是 CSTP 帧类型。
+// Type 是 CSTP 包类型（与 openconnect 的 AC_PKT_* 一致）。
 type Type uint8
 
 const (
-	TypeData       Type = 0x00 // IP 数据包
-	TypeDPDReq     Type = 0x03 // 对端保活请求
-	TypeDPDResp    Type = 0x04 // 保活应答
-	TypeDisconnect Type = 0x05 // 断开
-	TypeKeepalive  Type = 0x07 // 保活
-	TypeCompressed Type = 0x08 // 压缩数据（未实现）
-	TypeTerminate  Type = 0x09 // 终止
+	TypeData       Type = 0 // 未压缩数据（IP 包）
+	TypeDPDReq     Type = 3 // 对端保活请求
+	TypeDPDResp    Type = 4 // 保活应答
+	TypeDisconnect Type = 5 // 客户端断开通知
+	TypeKeepalive  Type = 7 // 保活
+	TypeCompressed Type = 8 // 压缩数据（未实现）
+	TypeTerminate  Type = 9 // 服务端踢下线
 )
 
 func (t Type) String() string {
@@ -63,19 +69,19 @@ var ErrBadFrame = errors.New("cstp: 帧头不合法")
 // ErrTooLarge 表示长度字段超过上限。
 var ErrTooLarge = errors.New("cstp: 帧过大")
 
-// MaxPayload 是单帧负载上限（IP 包不会超过 MTU，留足余量）。
+// MaxPayload 是单帧负载上限。
 const MaxPayload = 64 * 1024
 
-// WriteFrame 写一帧。
+// WriteFrame 写一个 TCP CSTP 帧。
 func WriteFrame(w io.Writer, typ Type, payload []byte) error {
 	if len(payload) > MaxPayload {
 		return ErrTooLarge
 	}
 	var h [HeaderLen]byte
-	h[0] = STF
-	binary.BigEndian.PutUint16(h[1:3], uint16(len(payload)))
-	h[3] = byte(typ)
-	// 4..7 保持 0
+	h[0], h[1], h[2], h[3] = magic0, magic1, magic2, versionByte
+	binary.BigEndian.PutUint16(h[4:6], uint16(len(payload)))
+	h[6] = byte(typ)
+	h[7] = 0
 	if _, err := w.Write(h[:]); err != nil {
 		return err
 	}
@@ -86,20 +92,20 @@ func WriteFrame(w io.Writer, typ Type, payload []byte) error {
 	return err
 }
 
-// ReadFrame 读一帧。返回的 payload 是新分配的切片。
+// ReadFrame 读一个 TCP CSTP 帧。
 func ReadFrame(r io.Reader) (Type, []byte, error) {
 	var h [HeaderLen]byte
 	if _, err := io.ReadFull(r, h[:]); err != nil {
 		return 0, nil, err
 	}
-	if h[0] != STF {
-		return 0, nil, fmt.Errorf("%w: STF=0x%02x", ErrBadFrame, h[0])
+	if h[0] != magic0 || h[1] != magic1 || h[2] != magic2 || h[3] != versionByte || h[7] != 0 {
+		return 0, nil, fmt.Errorf("%w: %02x %02x %02x %02x", ErrBadFrame, h[0], h[1], h[2], h[3])
 	}
-	n := int(binary.BigEndian.Uint16(h[1:3]))
+	n := int(binary.BigEndian.Uint16(h[4:6]))
 	if n > MaxPayload {
 		return 0, nil, ErrTooLarge
 	}
-	typ := Type(h[3])
+	typ := Type(h[6])
 	if n == 0 {
 		return typ, nil, nil
 	}
@@ -108,4 +114,24 @@ func ReadFrame(r io.Reader) (Type, []byte, error) {
 		return 0, nil, err
 	}
 	return typ, buf, nil
+}
+
+// WriteDTLS 写一个 DTLS 数据报：[1 字节类型][负载]。
+func WriteDTLS(w io.Writer, typ Type, payload []byte) error {
+	if len(payload) > MaxPayload {
+		return ErrTooLarge
+	}
+	b := make([]byte, 1+len(payload))
+	b[0] = byte(typ)
+	copy(b[1:], payload)
+	_, err := w.Write(b)
+	return err
+}
+
+// ParseDTLS 解析一个 DTLS 数据报。
+func ParseDTLS(pkt []byte) (Type, []byte, error) {
+	if len(pkt) < 1 {
+		return 0, nil, ErrBadFrame
+	}
+	return Type(pkt[0]), pkt[1:], nil
 }

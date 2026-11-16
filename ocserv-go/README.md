@@ -172,10 +172,53 @@ docker run -d --name ocserv-go \
 5) 收到回包  192.168.50.158:15353 -> 10.66.66.2:40000  负载=b'echo:hello-through-tunnel'
 ```
 
+## DTLS
+
+默认启用（`-dtls=false` 关闭），UDP 端口与 `-addr` 相同（可用 `-dtls-port` 指定）。
+
+Cisco 的 DTLS 不是普通握手：客户端在 `CONNECT` 里用 `X-DTLS-Master-Secret` 给出 48 字节主密钥，
+双方据此做「恢复握手」。实现方式：
+
+1. 读 `X-DTLS-Master-Secret`（96 个 hex）
+2. 生成 32 字节会话 ID，用 `X-DTLS-Session-ID` 下发
+3. 把这个主密钥按其会话 ID 预置进 pion/dtls 的 `SessionStore`（`dtls.Session{ID, Secret, CipherSuiteID}`）
+4. 客户端带该会话 ID 发起 DTLS，pion 走恢复流程，握手后数据面切到 UDP
+5. 数据帧在 DTLS 上用 **`[1 字节类型][负载]`**（不是 8 字节 CSTP 头）；控制帧仍走 TCP
+
+协商头（与真机一致）：
+
+```
+X-DTLS-Session-ID: <64 hex>
+X-DTLS-Port: 443
+X-DTLS-12: 1
+X-DTLS-DPD: 30
+X-DTLS-MTU: 1400
+X-DTLS12-CipherSuite: ECDHE-RSA-AES256-GCM-SHA384
+```
+
+> 需要 **RSA 证书**（Cisco 用 ECDHE-RSA 套件）；ECDSA 证书时 DTLS 自动禁用并打日志。
+
+**已验证**（openconnect 9.12 作为客户端）：
+
+```
+Established DTLS connection (using GnuTLS). Ciphersuite (DTLS1.2)-(ECDHE-RSA)-(AES-256-GCM).
+Configured as 10.66.66.2, with SSL connected and DTLS connected
+```
+
+连接持续 20 秒无重连、无 "Unrecoverable I/O error"；服务端日志 `DTLS 数据面已建立`。
+MTU 探针（类型 3）会按原长度回 `type=4`。
+
+**CSTP 头格式**（TCP，8 字节，与 openconnect 的 cstp.c 一致）：
+
+```
+'S' 'T' 'F' 0x01 | 长度(大端,4-5) | 类型(6) | 0(7) | 负载
+```
+
+类型：0=数据 3=DPD 4=DPD 应答 5=断开 7=保活 8=压缩 9=踢下线。
+
 ## 已知限制
 
 - **仅 IPv4**；IPv6 包直接丢弃
-- **无 DTLS**（Both 风格都只走 TLS/TCP；下一步实现）
 - **无 DTLS**：只走 TLS/TCP 传输，客户端会自动降级（性能略差）
 - **无压缩**（CSTP 压缩帧未实现）
 - **路由固定为全局**：不下发 split-include/exclude
