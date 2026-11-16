@@ -605,6 +605,15 @@ func maskPass(b []byte) string {
 		low = strings.ToLower(s)
 		off = i + len("<password>") + 3
 	}
+	// 表单编码（application/x-www-form-urlencoded）也要打码
+	if i := strings.Index(low, "password="); i >= 0 {
+		st := i + len("password=")
+		en := strings.IndexByte(s[st:], '&')
+		if en < 0 {
+			en = len(s) - st
+		}
+		s = s[:st] + "***" + s[st+en:]
+	}
 	return s
 }
 
@@ -713,12 +722,30 @@ func (s *server) handleInit(w http.ResponseWriter, r *http.Request, body []byte)
 
 func (s *server) handleAuth(w http.ResponseWriter, r *http.Request, body []byte) {
 	sess := sessionOf(r.Context())
-	ca, err := acxml.Parse(body)
-	if err != nil {
-		writeXML(w, acxml.RequestUsername())
-		return
+	ck := ""
+	if c, cerr := r.Cookie("webvpncontext"); cerr == nil {
+		ck = c.Value
 	}
-	user, pass := ca.Credentials()
+	log.Printf("AC /auth: ctype=%q ctxCookie=%q len=%d body=%s",
+		r.Header.Get("Content-Type"), ck, len(body), maskPass(body))
+
+	// 真 AnyConnect（Android）第二步是把它当普通 HTML 表单提交的：
+	// application/x-www-form-urlencoded，body 里只有 username=xxx / password=xxx，
+	// 不是 config-auth XML —— 两种都要认。
+	var user, pass string
+	if strings.Contains(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		_ = r.ParseForm()
+		user, pass = strings.TrimSpace(r.PostFormValue("username")), r.PostFormValue("password")
+	} else {
+		ca, err := acxml.Parse(body)
+		if err != nil {
+			log.Printf("AC /auth: XML 解析失败: %v", err)
+			writeXML(w, acxml.RequestUsername())
+			return
+		}
+		user, pass = ca.Credentials()
+	}
 
 	// 真 ocserv / 真 AnyConnect 是两步式：先发用户名，再只发密码；
 	// 用户名靠 webvpncontext cookie 记住（客户端可能在新连接上发第二步）。
@@ -750,9 +777,8 @@ func (s *server) handleAuth(w http.ResponseWriter, r *http.Request, body []byte)
 		return
 	}
 
-	// 记下客户端提交的原文（密码打码），排障用
-	log.Printf("AC 认证: type=%s client=%s user=%q passLen=%d body=%s",
-		ca.Type, ca.Client, user, len(pass), maskPass(body))
+	// 记下客户端提交的凭据（密码打码），排障用
+	log.Printf("AC 认证: user=%q passLen=%d body=%s", user, len(pass), maskPass(body))
 	if !s.users.Verify(user, pass) {
 		log.Printf("认证失败: %s", user)
 		writeXML(w, acxml.RequestPassword()) // 与真机一致：重发密码表单
