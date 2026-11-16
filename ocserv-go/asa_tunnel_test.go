@@ -74,6 +74,28 @@ func TestASAStyle(t *testing.T) {
 		t.Fatalf("缺少 tg cookie: %v", hdrs["set-cookie"])
 	}
 
+	// 1b) 浏览器登录页：结构与真机一致（form id/action、隐藏字段）
+	status, _, page := doReq(t, conn, br, "GET", "/+CSCOE+/logon.html", map[string]string{
+		"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/120",
+	}, "")
+	if !strings.Contains(status, "200") {
+		t.Fatalf("浏览器登录页状态码: %s", status)
+	}
+	for _, want := range []string{`id="unicorn_form"`, `action="/+webvpn+/index.html"`, `name="csrf_token"`, `id="password_input"`} {
+		if !strings.Contains(string(page), want) {
+			t.Fatalf("登录页缺少 %q，实际开头:\n%s", want, string(page[:min(len(page), 300)]))
+		}
+	}
+
+	// 1c) 浏览器提交错误密码 → HTML 页面里带错误信息（不是 XML）
+	status, _, page = doReq(t, conn, br, "POST", "/+webvpn+/index.html", map[string]string{
+		"Content-Type": "application/x-www-form-urlencoded",
+		"User-Agent":   "Mozilla/5.0 (X11; Linux x86_64) Chrome/120",
+	}, "username=alice&password=wrong")
+	if !strings.Contains(status, "200") || !strings.Contains(string(page), "Login failed.") || strings.Contains(string(page), "<auth") {
+		t.Fatalf("浏览器失败响应不对: %s\n%s", status, page[:min(len(page), 200)])
+	}
+
 	// 2) 登录页 XML
 	status, hdrs, body := doReq(t, conn, br, "GET", "/+webvpn+/index.html", map[string]string{
 		"User-Agent": "Open AnyConnect VPN Agent v9.12",
@@ -93,8 +115,9 @@ func TestASAStyle(t *testing.T) {
 
 	// 3) 错误密码 → error id=15
 	status, _, body = doReq(t, conn, br, "POST", "/+webvpn+/index.html", map[string]string{
-		"Content-Type": "application/x-www-form-urlencoded",
-		"User-Agent":   "Open AnyConnect VPN Agent v9.12",
+		"Content-Type":        "application/x-www-form-urlencoded",
+		"User-Agent":          "Open AnyConnect VPN Agent v9.12",
+		"X-Transcend-Version": "1",
 	}, "username=alice&password=wrong")
 	if !strings.Contains(status, "200") || !strings.Contains(string(body), `<error id="15"`) {
 		t.Fatalf("失败响应不对: %s\n%s", status, body)
@@ -102,8 +125,9 @@ func TestASAStyle(t *testing.T) {
 
 	// 4) 正确密码 → success + webvpn cookie
 	status, hdrs, body = doReq(t, conn, br, "POST", "/+webvpn+/index.html", map[string]string{
-		"Content-Type": "application/x-www-form-urlencoded",
-		"User-Agent":   "Open AnyConnect VPN Agent v9.12",
+		"Content-Type":        "application/x-www-form-urlencoded",
+		"User-Agent":          "Open AnyConnect VPN Agent v9.12",
+		"X-Transcend-Version": "1",
 	}, "username=alice&password=test123")
 	if !strings.Contains(status, "200") || !strings.Contains(string(body), `id="success"`) {
 		t.Fatalf("成功响应不对: %s\n%s", status, body)
@@ -214,6 +238,32 @@ func readResp(t *testing.T, br *bufio.Reader) (string, map[string][]string, []by
 			hdrs[k] = append(hdrs[k], v)
 		}
 	}
+	// chunked（大页面 Go 会用 chunked，没有 Content-Length）
+	if strings.Contains(strings.ToLower(first(hdrs, "transfer-encoding")), "chunked") {
+		var out []byte
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				t.Fatalf("读 chunk 头失败: %v", err)
+			}
+			sizeStr := strings.TrimSpace(strings.SplitN(line, ";", 2)[0])
+			n, err := strconv.ParseInt(sizeStr, 16, 64)
+			if err != nil {
+				t.Fatalf("chunk 长度非法: %q", sizeStr)
+			}
+			if n == 0 {
+				_, _ = br.ReadString('\n')
+				break
+			}
+			chunk := make([]byte, n)
+			if _, err := io.ReadFull(br, chunk); err != nil {
+				t.Fatalf("读 chunk 失败: %v", err)
+			}
+			out = append(out, chunk...)
+			_, _ = br.ReadString('\n')
+		}
+		return strings.TrimSpace(status), hdrs, out
+	}
 	n, _ := strconv.Atoi(first(hdrs, "content-length"))
 	buf := make([]byte, n)
 	if n > 0 {
@@ -290,4 +340,11 @@ func ipChecksum(h []byte) uint16 {
 		sum = (sum & 0xFFFF) + (sum >> 16)
 	}
 	return ^uint16(sum)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

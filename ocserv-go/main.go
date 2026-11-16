@@ -352,11 +352,55 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case p == "/CSTP":
 		s.handleConnect(w, r)
 	default:
+		if s.serveASAStatic(w, r, p) {
+			return
+		}
 		if *verbose {
 			log.Printf("%s %s（忽略）", r.Method, r.URL.Path)
 		}
 		http.NotFound(w, r)
 	}
+}
+
+// serveASAStatic 复刻真机会被扫描器探测的静态资源路径（内容是自绘的占位）。
+func (s *server) serveASAStatic(w http.ResponseWriter, r *http.Request, p string) bool {
+	switch p {
+	case "/+CSCOE+/logon_custom.css":
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		_, _ = w.Write(asa.LogonCSS())
+		return true
+	case "/+CSCOU+/portal.css":
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		_, _ = w.Write(asa.PortalCSS())
+		return true
+	case "/+CSCOE+/win.js":
+		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+		_, _ = w.Write(asa.WinJS())
+		return true
+	case "/+CSCOE+/blank.html":
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte("<html></html>"))
+		return true
+	case "/+CSCOU+/csco_logo.gif":
+		b, ct := asa.TinyImage("gif")
+		w.Header().Set("Content-Type", ct)
+		_, _ = w.Write(b)
+		return true
+	case "/+CSCOU+/login-header-icon.jpg", "/+CSCOU+/login-header-middle.jpg", "/+CSCOU+/login-header-end.jpg":
+		b, ct := asa.TinyImage("jpeg")
+		w.Header().Set("Content-Type", ct)
+		_, _ = w.Write(b)
+		return true
+	}
+	return false
+}
+
+// isACMClient 判断请求来自 AnyConnect 客户端（要 XML）还是浏览器（要 HTML）。
+func isACMClient(r *http.Request) bool {
+	if r.Header.Get("X-Transcend-Version") != "" || r.Header.Get("X-Aggregate-Auth") != "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(r.UserAgent()), "anyconnect")
 }
 
 // commonHeaders 复刻 Cisco ASA 的常见安全头。
@@ -411,23 +455,41 @@ func (s *server) handleASALoginPage(w http.ResponseWriter, r *http.Request) {
 
 // handleASASubmit: POST /+webvpn+/index.html（表单，不是 XML）
 func (s *server) handleASASubmit(w http.ResponseWriter, r *http.Request) {
+	s.doLogin(w, r)
+}
+
+// handleLogonPage 渲染浏览器登录页。
+func (s *server) handleLogonPage(w http.ResponseWriter, r *http.Request, errMsg string) {
+	csrf := asa.NewCSRF()
+	http.SetCookie(w, &http.Cookie{Name: "CSRFtoken", Value: csrf, Path: "/", Secure: s.secure})
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(asa.LogonPage(csrf, errMsg))
+}
+
+// handleLogonSubmit 处理浏览器表单提交（同一套用户库）。
+func (s *server) handleLogonSubmit(w http.ResponseWriter, r *http.Request) {
+	s.doLogin(w, r)
+}
+
+// doLogin 是统一的登录处理：客户端拿 XML，浏览器拿 HTML/跳转。
+func (s *server) doLogin(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
 	user := strings.TrimSpace(r.PostFormValue("username"))
 	pass := r.PostFormValue("password")
-
-	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-	w.Header().Set("X-Transcend-Version", "1")
+	client := isACMClient(r)
 
 	if user == "" || !s.users.Verify(user, pass) {
 		if user != "" {
 			log.Printf("认证失败: %s", user)
 		}
-		for _, n := range []string{"webvpn", "webvpn_as", "webvpnc"} {
-			s.expiredCookie(w, n)
+		if client {
+			w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+			w.Header().Set("X-Transcend-Version", "1")
+			_, _ = w.Write(asa.LoginFailed("Login failed."))
+			return
 		}
-		http.SetCookie(w, &http.Cookie{Name: "webvpnlogin", Value: "1", Path: "/", Secure: s.secure})
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(asa.LoginFailed("Login failed."))
+		s.handleLogonPage(w, r, "Login failed.")
 		return
 	}
 
@@ -435,44 +497,19 @@ func (s *server) handleASASubmit(w http.ResponseWriter, r *http.Request) {
 	s.tokensMu.Lock()
 	s.tokens[tok] = user
 	s.tokensMu.Unlock()
-
+	http.SetCookie(w, &http.Cookie{Name: "webvpn", Value: tok, Path: "/", Secure: s.secure, HttpOnly: true})
 	if sess := sessionOf(r.Context()); sess != nil {
 		sess.mu.Lock()
 		sess.user, sess.authed = user, true
 		sess.mu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: "webvpn", Value: tok, Path: "/", Secure: s.secure, HttpOnly: true})
-	http.SetCookie(w, &http.Cookie{Name: "webvpnlogin", Value: "1", Path: "/", Secure: s.secure})
-	log.Printf("认证成功（webvpn）: %s", user)
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(asa.Success())
-}
-
-// handleLogonPage 渲染浏览器登录页。
-func (s *server) handleLogonPage(w http.ResponseWriter, r *http.Request, errMsg string) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(asa.LogonPage(errMsg))
-}
-
-// handleLogonSubmit 处理浏览器表单提交（同一套用户库）。
-func (s *server) handleLogonSubmit(w http.ResponseWriter, r *http.Request) {
-	_ = r.ParseForm()
-	user := strings.TrimSpace(r.PostFormValue("username"))
-	pass := r.PostFormValue("password")
-	if user == "" || !s.users.Verify(user, pass) {
-		if user != "" {
-			log.Printf("认证失败（web 登录页）: %s", user)
-		}
-		s.handleLogonPage(w, r, "Login failed. 用户名或密码错误。")
+	log.Printf("认证成功: %s", user)
+	if client {
+		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+		w.Header().Set("X-Transcend-Version", "1")
+		_, _ = w.Write(asa.Success())
 		return
 	}
-	tok := asa.NewToken()
-	s.tokensMu.Lock()
-	s.tokens[tok] = user
-	s.tokensMu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "webvpn", Value: tok, Path: "/", Secure: s.secure, HttpOnly: true})
-	log.Printf("认证成功（web 登录页）: %s", user)
 	http.Redirect(w, r, "/+CSCOE+/portal.html", http.StatusFound)
 }
 

@@ -75,11 +75,18 @@ sudo ./bin/ocserv-go \
   | `POST /`（XML init） | 404 | 404 |
   | `GET /` | AnyConnect UA → 302 `/+webvpn+/index.html` + `tg=` cookie；浏览器 → 带 JS 跳转的 HTML | 同 |
   | `GET /+webvpn+/index.html` | `text/xml`，`X-Transcend-Version: 1`，裸 `<auth id="main">` | 同（不含组选择） |
+  | `GET /+CSCOE+/logon.html` | 浏览器登录页（table 布局、`unicorn_form`、csrf_token、USERNAME/PASSWORD） | 同 |
+  | 静态资源 | `/+CSCOE+/logon_custom.css`、`/+CSCOU+/portal.css`、`/+CSCOU+/csco_logo.gif`、`/+CSCOU+/login-header-*.jpg` | 均返回 200，内容是自绘占位 |
+  | 提交分流 | AnyConnect 客户端（`X-Transcend-Version` / UA）拿 XML；浏览器拿 HTML + 302 到门户 | 同 |
   | `POST /+webvpn+/index.html` | 表单 `group_list/username/password`；失败插 `<error id="15" param1="" param2="">Login failed.</error>`；成功 `id="success"` + `webvpn` cookie | 同 |
   | `CONNECT /CSTP` | 带 `webvpn` cookie（可在新连接上） | 支持 cookie 或同连接会话 |
 
   > 真机的登录页带 `group_list`（权限组下拉）。本实现**不做组选择**：
   > 组名属于各站点的私有配置，不内置也不照搬。
+  >
+  > 页面的 HTML/XML 骨架（元素 id、name、隐藏字段、表单 action、错误码）按真机对齐，
+  > 但**样式与图片是自绘的占位**，不随包分发 Cisco 的商标/资源。
+  > 目的：让扫描器看到一个"像 ASA"的表面；认证成功之后的隧道逻辑仍走本实现。
 
 - **`ocserv`**：标准 ocserv 的 XML 流程（`POST /` → `auth-request`，`POST /auth` → `auth-reply`）。
 

@@ -14,6 +14,11 @@ import (
 	"encoding/hex"
 	"encoding/xml"
 	"fmt"
+	"image"
+	"image/color/palette"
+	"image/gif"
+	"image/jpeg"
+	"image/png"
 	"strings"
 )
 
@@ -90,55 +95,102 @@ func NewToken() string {
 	return hex.EncodeToString(b)
 }
 
-// LogonPage 是给浏览器看的登录页（真机同款路径 /+CSCOE+/logon.html）。
-// 样式自绘，不复用 Cisco 的图片/样式资源。
-func LogonPage(errMsg string) []byte {
-	var errHTML string
+// LogonPage 复刻真机登录页的骨架（table 布局、元素 id/name、隐藏字段、CSRF cookie），
+// 样式为自绘等价实现，不使用 Cisco 的图片与样式表资源。
+func LogonPage(csrf, errMsg string) []byte {
+	msg := "Please enter your username and password."
 	if errMsg != "" {
-		errHTML = `<div class="err">` + esc(errMsg) + `</div>`
+		msg = errMsg
 	}
 	return []byte(`<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<html style="height:100%;width:100%;">
+<head>
+<meta charset="utf-8">
+<meta name="HandheldFriendly" content="true" />
+<meta name="viewport" content="width=500,user-scalable=no" />
 <title>SSL VPN Service</title>
 <style>
-  * { box-sizing: border-box; }
-  body { margin:0; font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-         background:#eef2f6; color:#333; }
-  .top { background:#1f5c98; color:#fff; padding:14px 24px; font-size:18px; font-weight:600;
-         letter-spacing:.3px; }
-  .wrap { max-width:420px; margin:48px auto; background:#fff; border:1px solid #d7dee6;
-          border-radius:6px; box-shadow:0 6px 20px rgba(31,92,152,.12); overflow:hidden; }
-  .hd { padding:18px 24px 0; font-size:16px; color:#1f5c98; font-weight:600; }
-  .sub { padding:6px 24px 0; color:#7b8794; font-size:13px; }
-  form { padding:16px 24px 24px; }
-  .row { margin-top:14px; }
-  .lbl { display:block; font-size:12px; color:#5b6b7b; margin-bottom:4px; }
-  .inp { width:100%; padding:9px 10px; border:1px solid #c7d2dd; border-radius:4px; font-size:14px; }
-  .inp:focus { outline:none; border-color:#1f5c98; box-shadow:0 0 0 2px rgba(31,92,152,.15); }
-  .btn { margin-top:20px; width:100%; padding:10px; background:#1f5c98; color:#fff; border:0;
-         border-radius:4px; font-size:15px; cursor:pointer; }
-  .btn:hover { background:#17497a; }
-  .err { margin:0 24px; padding:10px 12px; background:#fdecea; border:1px solid #f5c6c2;
-         color:#a12a20; border-radius:4px; font-size:13px; }
-  .ft { padding:12px 24px 18px; color:#9aa7b4; font-size:12px; text-align:center; }
-</style></head>
+  html,body{height:100%;margin:0;font-family:Arial,Helvetica,sans-serif;font-size:13px;color:#000;background:#fff;}
+  #logon_wrap{width:350px;margin:40px auto;}
+  #form_title{width:100%;border-collapse:collapse;}
+  #form_title .hd{background:#f2f4f6;border:1px solid #858A91;border-bottom:0;height:40px;}
+  #form_title .hd span{color:#7d8184;font-weight:bold;display:block;text-align:center;line-height:40px;}
+  #logon_message_text{padding:15px 15px 5px;border-left:1px solid #858A91;border-right:1px solid #858A91;}
+  .box{border:1px solid #858A91;border-top:0;padding:0 20px 10px;}
+  table.form{border-collapse:collapse;width:100%;}
+  table.form td{padding:4px 0;}
+  input[type=text],input[type=password]{border:1px solid gray;padding:2px;width:180px;}
+  input[type=submit]{font-weight:bold;cursor:pointer;padding:2px 14px;}
+  .err{color:#b00;}
+</style>
+</head>
 <body>
-<div class="top">SSL VPN Service</div>
-<div class="wrap">
-  <div class="hd">Sign in</div>
-  <div class="sub">Please enter your username and password.</div>
-  ` + errHTML + `
-  <form method="post" action="/+CSCOE+/logon.html">
-    <div class="row"><label class="lbl" for="username">Username</label>
-      <input id="username" name="username" class="inp" type="text" autocomplete="username" autofocus></div>
-    <div class="row"><label class="lbl" for="password">Password</label>
-      <input id="password" name="password" class="inp" type="password" autocomplete="current-password"></div>
-    <button class="btn" type="submit" name="Login" value="Login">Login</button>
-  </form>
-  <div class="ft">ocserv-go · ASA 风格演示</div>
+<div id="logon_wrap">
+<form id="unicorn_form" method="POST" onsubmit="return formSubmit();" autocomplete="off" action="/+webvpn+/index.html">
+<input name="tgroup" type="hidden" value="">
+<input name="next" type="hidden" value="">
+<input name="tgcookieset" type="hidden" value="">
+<input name="csrf_token" type="hidden" value="` + esc(csrf) + `">
+<script>document.cookie="CSRFtoken="+"` + esc(csrf) + `"+"; path=/; secure";</script>
+<table id="form_title" cellspacing="0" cellpadding="0" border="0">
+<tr><td class="hd"><span>Login</span></td></tr>
+</table>
+<div id="logon_message_text">` + esc(msg) + `</div>
+<div class="box">
+<table class="form" border="0" cellspacing="0" cellpadding="0">
+<tr><td colspan="2">&nbsp;</td></tr>
+<tr><td nowrap id="username_field">USERNAME:</td>
+    <td><input autocomplete="off" id="username" name="username" type="text" value=""></td></tr>
+<tr><td nowrap id="password_field">PASSWORD:</td>
+    <td><input autocomplete="off" id="password_input" name="password" type="password"></td></tr>
+<tr height="40"><td colspan="2" align="center">
+    <input type="submit" name="Login" value="Login" /></td></tr>
+</table>
 </div>
+</form>
+</div>
+<script>
+function formSubmit(){ return true; }
+</script>
 </body></html>`)
+}
+
+// CSRF token：真机会下发并让页面写入 CSRFtoken cookie，这里只做形似。
+func NewCSRF() string {
+	b := make([]byte, 20)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b)
+}
+
+// LogonCSS 对应 /+CSCOE+/logon_custom.css（自绘，内容极简）。
+func LogonCSS() []byte { return []byte("/* logon_custom.css */\n") }
+
+// PortalCSS 对应 /+CSCOU+/portal.css。
+func PortalCSS() []byte { return []byte("/* portal.css */\n") }
+
+// WinJS 对应 /+CSCOE+/win.js。
+func WinJS() []byte { return []byte("/* win.js */\n") }
+
+// TinyImage 返回一张 1x1 图片（占位，用于真机会引用的 logo/header 路径）。
+func TinyImage(kind string) (data []byte, ctype string) {
+	var buf bytes.Buffer
+	switch kind {
+	case "gif":
+		if err := gif.Encode(&buf, image.NewPaletted(image.Rect(0, 0, 1, 1), palette.Plan9), nil); err == nil {
+			return buf.Bytes(), "image/gif"
+		}
+	case "png":
+		if err := png.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 1, 1))); err == nil {
+			return buf.Bytes(), "image/png"
+		}
+	default:
+		if err := jpeg.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 1, 1)), nil); err == nil {
+			return buf.Bytes(), "image/jpeg"
+		}
+	}
+	return []byte{}, "application/octet-stream"
 }
 
 // PortalPage 是登录成功后的简单门户页。
