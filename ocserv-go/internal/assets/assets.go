@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -308,9 +309,10 @@ func SanitizeLogonHTML(b []byte) []byte {
 		if len(n) < 3 { // 太短的不替换，避免误伤
 			continue
 		}
-		s = strings.ReplaceAll(s, html.EscapeString(n), "")
-		s = strings.ReplaceAll(s, n, "")
-		s = strings.ReplaceAll(s, url.PathEscape(n), "")
+		// 普通写法、HTML 实体写法（下划线写成 &#x5F; 之类）、URL 转义写法都要覆盖，
+		// 统一替换成固定组名（而不是删空，避免页面 JS 结构被破坏）
+		s = entityRegexp(n).ReplaceAllString(s, GroupName)
+		s = strings.ReplaceAll(s, url.PathEscape(n), GroupName)
 	}
 	// 清理完再放固定选项，避免它自己被当成组名清掉
 	s = reSelectGroup.ReplaceAllStringFunc(s, func(m string) string {
@@ -326,4 +328,51 @@ func needsSanitize(name string) bool {
 	}
 	low := strings.ToLower(name)
 	return strings.HasSuffix(low, ".html") || strings.HasSuffix(low, ".htm")
+}
+
+// entityRegexp 构造「每个字符都允许写成 HTML 实体」的正则，
+// 用来匹配页面里被转义过的组名（如 YouzuVPN&#x5F;Sec）。
+func entityRegexp(s string) *regexp.Regexp {
+	var b strings.Builder
+	b.WriteString(`(?i)`)
+	for _, r := range s {
+		b.WriteString(`(?:` + regexp.QuoteMeta(string(r)) +
+			`|&#[xX]0*` + strconv.FormatInt(int64(r), 16) + `;` +
+			`|&#0*` + strconv.FormatInt(int64(r), 10) + `;)`)
+	}
+	return regexp.MustCompile(b.String())
+}
+
+// ReSanitizeDir 把目录里已存在的 +CSCOE+/*.html 重新脱敏一遍
+// （用于修复「上传时脱敏规则还不完善」留下的旧文件）。
+func ReSanitizeDir(dir string) (int, error) {
+	if dir == "" {
+		return 0, nil
+	}
+	n := 0
+	err := filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		rel, rerr := filepath.Rel(dir, p)
+		if rerr != nil {
+			return nil
+		}
+		if !needsSanitize(filepath.ToSlash(rel)) {
+			return nil
+		}
+		b, rderr := os.ReadFile(p)
+		if rderr != nil {
+			return nil
+		}
+		clean := SanitizeLogonHTML(b)
+		if string(clean) != string(b) {
+			if werr := os.WriteFile(p, clean, 0o644); werr != nil {
+				return werr
+			}
+			n++
+		}
+		return nil
+	})
+	return n, err
 }

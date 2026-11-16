@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hakureiyuyuko/ocserv-go/internal/assets"
 	"github.com/hakureiyuyuko/ocserv-go/panel"
 )
 
@@ -21,6 +22,7 @@ func runPanel() int {
 	importOld := fs.String("import", "", "从旧 Node 面板的 config.json 迁移")
 	setPw := fs.String("set-password", "", "重置面板账号密码，格式 用户名:新密码")
 	initOnly := fs.Bool("init", false, "只生成/保存配置文件后退出（安装脚本用）")
+	resanitize := fs.Bool("resanitize", false, "对已上传的 +CSCOE+/*.html 重新脱敏（替换组名）后退出")
 	_ = fs.Parse(os.Args[2:])
 
 	cfg, err := panel.LoadConfig(*confPath)
@@ -59,6 +61,15 @@ func runPanel() int {
 		return 1
 	}
 
+	if *resanitize {
+		n, err := assets.ReSanitizeDir(cfg.AssetsDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "重新脱敏失败: %v\n", err)
+			return 1
+		}
+		fmt.Printf("已重新脱敏 %d 个文件（目录 %s）\n", n, cfg.AssetsDir)
+		return 0
+	}
 	if *initOnly {
 		fmt.Printf("配置已写入 %s\n", *confPath)
 		return 0

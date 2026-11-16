@@ -227,3 +227,30 @@ func TestSanitizeFixedGroup(t *testing.T) {
 		t.Fatalf("原组名应被清除:\n%s", twice)
 	}
 }
+
+// 组名在 JS 里被 HTML 实体化（下划线写成 &#x5F;）时也要替换。
+func TestSanitizeEntityEscapedGroup(t *testing.T) {
+	in := `<select name="tgroup" onchange="updateLogonForm(this.value,{'Corp&#x5F;VPN':true})"><option value="Corp&#x5F;VPN">Corp_VPN</option></select>`
+	out := string(SanitizeLogonHTML([]byte(in)))
+	if strings.Contains(strings.ToLower(out), "corp") {
+		t.Fatalf("实体转义的组名未被清掉:\n%s", out)
+	}
+	if !strings.Contains(out, "HetraVPN_Group") {
+		t.Fatalf("应替换成固定组名:\n%s", out)
+	}
+}
+
+func TestReSanitizeDir(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(dir, "+CSCOE+"), 0o755)
+	f := filepath.Join(dir, "+CSCOE+", "logon.html")
+	_ = os.WriteFile(f, []byte(`<option>Old_Corp_Group</option><input name="username">`), 0o644)
+	n, err := ReSanitizeDir(dir)
+	if err != nil || n != 1 {
+		t.Fatalf("应修复 1 个文件，得到 %d / %v", n, err)
+	}
+	b, _ := os.ReadFile(f)
+	if strings.Contains(string(b), "Old_Corp_Group") {
+		t.Fatalf("修复后仍含组名:\n%s", b)
+	}
+}
