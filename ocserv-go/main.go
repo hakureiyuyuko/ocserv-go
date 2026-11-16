@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -378,7 +379,52 @@ func makeSelfSigned(host string) (tls.Certificate, error) {
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if isACMClient(r) {
+		rec := &acmRecorder{ResponseWriter: w}
+		defer func() {
+			log.Printf("AC 请求: %s %s UA=%q agg=%q → %d (%d 字节)",
+				r.Method, r.URL.Path, r.UserAgent(), r.Header.Get("X-Aggregate-Auth"), rec.code, rec.n)
+		}()
+		s.commonHeaders(rec)
+		s.route(rec, r)
+		return
+	}
 	s.commonHeaders(w)
+	s.route(w, r)
+}
+
+// acmRecorder 记录响应码/字节数，并把 Hijack 透传下去（CSTP 需要直接接管连接）。
+type acmRecorder struct {
+	http.ResponseWriter
+	code int
+	n    int64
+}
+
+func (a *acmRecorder) WriteHeader(c int) {
+	if a.code == 0 {
+		a.code = c
+	}
+	a.ResponseWriter.WriteHeader(c)
+}
+
+func (a *acmRecorder) Write(b []byte) (int, error) {
+	if a.code == 0 {
+		a.code = http.StatusOK
+	}
+	n, err := a.ResponseWriter.Write(b)
+	a.n += int64(n)
+	return n, err
+}
+
+func (a *acmRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := a.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("hijack unsupported")
+	}
+	return hj.Hijack()
+}
+
+func (s *server) route(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodConnect {
 		s.handleConnect(w, r)
 		return
@@ -394,13 +440,13 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.handleRootGET(w, r)
 			return
 		}
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 		if s.style == "ocserv" {
-			body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 			s.handleInit(w, r, body)
 			return
 		}
-		// ASA 对 POST / 返回 404（真机行为）
-		http.NotFound(w, r)
+		// ASA 聚合认证：真 AnyConnect 的首包就是 POST / + <config-auth type="init">
+		s.handleAggregateAuth(w, r, body)
 	case p == "/+CSCOE+/logon.html":
 		if r.Method == http.MethodGet {
 			s.handleLogonPage(w, r, "")
@@ -525,9 +571,59 @@ func (s *server) handleASALoginPage(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(asa.LoginPage())
 }
 
-// handleASASubmit: POST /+webvpn+/index.html（表单，不是 XML）
+// handleASASubmit: POST /+webvpn+/index.html（表单或聚合认证 XML，都可能落到这里）
 func (s *server) handleASASubmit(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if b := bytes.TrimSpace(body); len(b) > 0 && b[0] == '<' {
+		s.handleAggregateAuth(w, r, body)
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
 	s.doLogin(w, r)
+}
+
+// handleAggregateAuth 处理 ASA 聚合认证（POST / 或 /+webvpn+/index.html 的 config-auth XML）。
+// 协议：init → auth-request（要用户名密码）→ auth-reply（带凭据）→ auth-reply/auth id="success"。
+func (s *server) handleAggregateAuth(w http.ResponseWriter, r *http.Request, body []byte) {
+	ca, err := acxml.Parse(body)
+	if err != nil {
+		// 不是 XML（老客户端/浏览器表单）：原样交给表单处理
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		s.doLogin(w, r)
+		return
+	}
+	user, pass := ca.Credentials()
+	if user == "" {
+		s.writeASAXML(w, acxml.ASARequestLogin())
+		return
+	}
+	if !s.users.Verify(user, pass) {
+		log.Printf("认证失败: %s", user)
+		s.writeASAXML(w, acxml.ASALoginFailed("Login failed."))
+		return
+	}
+	tok := asa.NewToken()
+	s.tokensMu.Lock()
+	s.tokens[tok] = user
+	s.tokensMu.Unlock()
+	http.SetCookie(w, &http.Cookie{Name: "webvpn", Value: tok, Path: "/", Secure: s.secure, HttpOnly: true})
+	if sess := sessionOf(r.Context()); sess != nil {
+		sess.mu.Lock()
+		sess.user, sess.authed = user, true
+		sess.mu.Unlock()
+	}
+	log.Printf("认证成功: %s（聚合认证）", user)
+	s.writeASAXML(w, acxml.ASASuccess())
+}
+
+// writeASAXML 是聚合认证响应的固定头（真 ASA 会带 X-Aggregate-Auth: 1）。
+func (s *server) writeASAXML(w http.ResponseWriter, body []byte) {
+	h := w.Header()
+	h.Set("Content-Type", "text/xml; charset=utf-8")
+	h.Set("X-Transcend-Version", "1")
+	h.Set("X-Aggregate-Auth", "1")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 
 // handleLogonPage 渲染浏览器登录页。

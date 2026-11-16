@@ -41,6 +41,7 @@ type Form struct {
 type Auth struct {
 	XMLName  xml.Name `xml:"auth"`
 	ID       string   `xml:"id,attr,omitempty"`
+	Title    string   `xml:"title,omitempty"`
 	Message  string   `xml:"message,omitempty"`
 	Username string   `xml:"username,omitempty"`
 	Password string   `xml:"password,omitempty"`
@@ -52,10 +53,54 @@ type ConfigAuth struct {
 	XMLName      xml.Name      `xml:"config-auth"`
 	Client       string        `xml:"client,attr,omitempty"`
 	Type         string        `xml:"type,attr,omitempty"`
+	AggrVersion  string        `xml:"aggregate-auth-version,attr,omitempty"`
 	Version      *Version      `xml:"version,omitempty"`
 	DeviceID     *DeviceID     `xml:"device-id,omitempty"`
 	Capabilities *Capabilities `xml:"capabilities,omitempty"`
 	Auth         *Auth         `xml:"auth,omitempty"`
+}
+
+// ASA 的聚合认证（aggregate auth）：真 AnyConnect 客户端默认走这套，
+// 首包就是 POST / + <config-auth type="init">，服务端必须回
+// <config-auth type="auth-request" aggregate-auth-version="2">，
+// 否则客户端直接报「连接尝试失败」（不会退化成表单流程）。
+//
+// 这里手写 XML：encoding/xml 会把空元素输出成 <input></input>，
+// 真 ASA 是自闭合的 <input/>，为兼容老客户端就照真机字节写。
+const asaAggr = "2"
+
+const asaFormXML = `<form method="post" action="/">` +
+	`<input type="text" name="username" label="Username"/>` +
+	`<input type="password" name="password" label="Password"/>` +
+	`<input type="submit" name="Login" value="Login"/>` +
+	`</form>`
+
+// ASARequestLogin 是聚合认证的「请输用户名密码」回复。
+func ASARequestLogin() []byte {
+	return []byte(xmlHeader + `<config-auth client="vpn" type="auth-request" aggregate-auth-version="` + asaAggr + `">` +
+		`<auth id="main"><title>Login</title><message>Please enter your username and password.</message>` +
+		asaFormXML + `</auth></config-auth>\n`)
+}
+
+// ASALoginFailed 是聚合认证下密码错的重试回复（仍带表单）。
+func ASALoginFailed(msg string) []byte {
+	if msg == "" {
+		msg = "Login failed."
+	}
+	return []byte(xmlHeader + `<config-auth client="vpn" type="auth-request" aggregate-auth-version="` + asaAggr + `">` +
+		`<auth id="main"><title>Login</title><message>` + escapeXML(msg) + `</message>` +
+		asaFormXML + `</auth></config-auth>\n`)
+}
+
+// ASASuccess 是聚合认证通过的回复。
+func ASASuccess() []byte {
+	return []byte(xmlHeader + `<config-auth client="vpn" type="auth-reply" aggregate-auth-version="` + asaAggr + `">` +
+		`<auth id="success"/></config-auth>\n`)
+}
+
+func escapeXML(s string) string {
+	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", "\"", "&quot;", "'", "&#39;")
+	return r.Replace(s)
 }
 
 // Capabilities 目前只用到 auth-method。
