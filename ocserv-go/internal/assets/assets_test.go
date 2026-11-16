@@ -254,3 +254,31 @@ func TestReSanitizeDir(t *testing.T) {
 		t.Fatalf("修复后仍含组名:\n%s", b)
 	}
 }
+
+// ASA 标准页面的 onchange 映射也要换成固定组名。
+func TestSanitizeLogonFormGroupMap(t *testing.T) {
+	in := `<select name="tgroup" onchange="updateLogonForm(this.value,{'Corp&#x5F;Sec':true})"></select>`
+	out := string(SanitizeLogonHTML([]byte(in)))
+	if strings.Contains(strings.ToLower(out), "corp") {
+		t.Fatalf("onchange 里的组名未清掉:\n%s", out)
+	}
+	if !strings.Contains(out, "{'HetraVPN_Group':true}") {
+		t.Fatalf("应替换成固定组名映射:\n%s", out)
+	}
+}
+
+// 已经脱敏过 option、只剩 onchange 映射的旧文件，ReSanitizeDir 也能修好。
+func TestReSanitizeLegacyFile(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(dir, "+CSCOE+"), 0o755)
+	f := filepath.Join(dir, "+CSCOE+", "logon.html")
+	_ = os.WriteFile(f, []byte(`<select name="tgroup" onchange="updateLogonForm(this.value,{'OldVendor&#x5F;VPN':true})"><option value="HetraVPN_Group" selected>HetraVPN_Group</option></select>`), 0o644)
+	n, err := ReSanitizeDir(dir)
+	if err != nil || n != 1 {
+		t.Fatalf("应修复 1 个文件，得到 %d / %v", n, err)
+	}
+	b, _ := os.ReadFile(f)
+	if strings.Contains(string(b), "OldVendor") {
+		t.Fatalf("修复后仍含旧组名:\n%s", b)
+	}
+}

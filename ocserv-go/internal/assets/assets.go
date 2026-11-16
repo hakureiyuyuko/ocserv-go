@@ -277,6 +277,9 @@ var (
 	reOption      = regexp.MustCompile(`(?is)<option\b[^>]*>(.*?)</option>`)
 	reOptionVal   = regexp.MustCompile(`(?i)value\s*=\s*["']([^"']*)["']`)
 	reGroupInput  = regexp.MustCompile(`(?is)<input\b[^>]*name\s*=\s*["']?group_list["']?[^>]*>`)
+	// ASA 标准页面把组名映射写在 onchange 里：
+	//   updateLogonForm(this.value,{'SomeGroup':true})
+	reLogonFormGroups = regexp.MustCompile(`(?is)(updateLogonForm\(\s*this\.value\s*,\s*)\{[^}]*\}`)
 )
 
 // SanitizeLogonHTML 把页面里暴露的「组名」统一替换成 GroupName。
@@ -304,6 +307,7 @@ func SanitizeLogonHTML(b []byte) []byte {
 
 	s = reOption.ReplaceAllString(s, "")
 	s = reGroupInput.ReplaceAllString(s, "")
+	s = reLogonFormGroups.ReplaceAllString(s, `${1}{'`+GroupName+`':true}`)
 
 	for _, n := range names {
 		if len(n) < 3 { // 太短的不替换，避免误伤
