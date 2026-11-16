@@ -210,6 +210,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("读取用户文件失败: %v", err)
 	}
+	if users.Len() == 0 {
+		log.Printf("警告: %s 里没有任何用户，所有登录都会被拒绝（到面板「用户管理」添加）", *usersFile)
+	}
 
 	s, err := newServer(serverConfig{
 		Users:     users,

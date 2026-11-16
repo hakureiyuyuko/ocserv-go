@@ -66,11 +66,13 @@ func Load(path string) (*Users, error) {
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}
-	if len(u.m) == 0 {
-		return nil, fmt.Errorf("%s: 没有任何用户", path)
-	}
+	// 空用户库不算错误：跟 ocserv 一样照常启动，只是所有登录都会被拒绝。
+	// （面板向导允许先配证书/服务、后加用户；若这里 fatal 就会变成 systemd 无限重启）
 	return u, nil
 }
+
+// Len 返回用户数，供启动时提示用。
+func (u *Users) Len() int { return len(u.m) }
 
 // Verify 校验用户名与密码。即使用户名不存在也会跑一次 bcrypt，避免用时差探测用户。
 func (u *Users) Verify(name, pass string) bool {

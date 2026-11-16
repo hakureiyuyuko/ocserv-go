@@ -251,20 +251,66 @@ function readUsers() {
 }
 function validName(n) { return typeof n === 'string' && /^[A-Za-z0-9._@-]{1,32}$/.test(n); }
 
+// 生成 ocpasswd 能认的密码哈希，不依赖 C 版 ocserv 的 ocpasswd 命令：
+//   · Go 后端：用 ocserv-go 自带的 hash 子命令（bcrypt）
+//   · 其它/失败：openssl passwd -6（SHA-512 crypt，ocserv 与 ocserv-go 都支持）
+async function genPasswdHash(pw) {
+  if (CFG.backend === 'go' && fileInfo(CFG.goBin)) {
+    const r = await run(CFG.goBin, ['hash', pw]);
+    const h = (r.out || '').trim();
+    if (r.code === 0 && /^\$2[abxy]?\$/.test(h)) return h;
+  }
+  const salt = require('crypto').randomBytes(8).toString('hex');
+  const r = await run('openssl', ['passwd', '-6', '-salt', salt, pw]);
+  const h = (r.out || '').trim();
+  return r.code === 0 && h.startsWith('$6$') ? h : '';
+}
+
+// 直接改 ocpasswd 文件（保留其它行与注释），格式同 ocpasswd：user:*:hash
+function writeUsers(entries) {
+  const body = entries.map((e) => e.name + ':*:' + e.hash).join('\n') + '\n';
+  writeAs(CFG.ocpasswd, entries.length ? body : '', 0o600);
+}
+function readUserLines() {
+  return (readText(CFG.ocpasswd, '') || '').split('\n')
+    .filter((l) => l.trim() && !l.trim().startsWith('#'));
+}
+function lineHash(l) {
+  const p = l.split(':');
+  return p.length >= 3 ? p.slice(2).join(':') : (p[1] || '');
+}
+
 async function addUser(name, password) {
   if (!validName(name)) return { ok: false, error: '用户名只允许字母/数字/._@- ，最长 32 位' };
   if (typeof password !== 'string' || password.length < 6) return { ok: false, error: '密码至少 6 位' };
-  // ocpasswd 交互式读取密码两次；无 tty 时从 stdin 读
+  // 有 ocpasswd 命令（C 版 ocserv 环境）就直接用它；容器/Alpine/纯 Go 环境没有该命令，走文件写入
   const r = await run('ocpasswd', ['-c', CFG.ocpasswd, name], password + '\n' + password + '\n');
-  if (!readUsers().some((u) => u.name === name)) {
-    return { ok: false, error: 'ocpasswd 写入失败: ' + (r.err || r.out || '未知错误').trim() };
+  if (readUsers().some((u) => u.name === name)) return { ok: true };
+
+  const hash = await genPasswdHash(password);
+  if (!hash) {
+    const why = ((r.err || '') + (r.out || '')).trim().slice(0, 200);
+    return { ok: false, error: '写入用户失败（本机没有 ocpasswd，且生成哈希也失败）' + (why ? ': ' + why : '') };
   }
+  const lines = readUserLines().filter((l) => l.split(':')[0] !== name);
+  const keep = lines.map((l) => ({ name: l.split(':')[0], hash: lineHash(l) }));
+  keep.push({ name, hash });
+  writeUsers(keep);
+  if (!readUsers().some((u) => u.name === name)) return { ok: false, error: 'ocpasswd 写入失败: ' + CFG.ocpasswd };
   return { ok: true };
 }
 async function delUser(name) {
   if (!validName(name)) return { ok: false, error: '非法用户名' };
   const r = await run('ocpasswd', ['-c', CFG.ocpasswd, '-d', name]);
-  if (readUsers().some((u) => u.name === name)) return { ok: false, error: '删除失败: ' + (r.err || r.out || '').trim() };
+  if (!readUsers().some((u) => u.name === name)) return { ok: true };
+
+  const keep = readUserLines()
+    .filter((l) => l.split(':')[0] !== name)
+    .map((l) => ({ name: l.split(':')[0], hash: lineHash(l) }));
+  writeUsers(keep);
+  if (readUsers().some((u) => u.name === name)) {
+    return { ok: false, error: '删除失败: ' + ((r.err || r.out || '') + '').trim() };
+  }
   return { ok: true };
 }
 async function getSessions() {
@@ -1003,6 +1049,10 @@ async function doApply(p, L) {
     if (!u || !u.name) continue;
     const r = await addUser(String(u.name), String(u.password || ''));
     L(r.ok ? 'v 已创建 VPN 用户: ' + u.name : 'x 用户 ' + u.name + ' 创建失败: ' + r.error);
+  }
+  if (!readUsers().length) {
+    L('! 注意：用户库里还没有任何 VPN 用户 —— 服务能起来，但客户端登录会被拒绝');
+    L('  到「第 3 步」或「用户管理」里添加一个用户即可，不必重跑本步');
   }
 
   const cidr = vpnNet + '/' + maskBits(vpnMask);

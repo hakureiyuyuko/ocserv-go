@@ -301,6 +301,7 @@
         <label class="muted"><input type="radio" name="wzmode" value="http"> HTTP-01（需公网 80）</label>
         <label class="muted"><input type="radio" name="wzmode" value="upload"> 上传已有证书</label>
         <label class="muted"><input type="radio" name="wzmode" value="selfsigned"> 自签（仅测试）</label>
+        <label class="muted hide" id="wzBuiltinMode"><input type="radio" name="wzmode" value="builtin"> 内置 DNS-01（Go 后端 / 内置 lego）</label>
       </div>
       <div id="wzBuiltin" class="hide">
         <div class="row" style="margin-bottom:8px">
@@ -690,6 +691,17 @@ async function checkInit() {
   try {
     const s = await api('/api/setup');
     wzSetup = s;
+    // Go 后端才有「内置 DNS-01（内置 lego）」：没有 C 版 ocserv/acme.sh 时这是唯一不依赖外部的选择，默认选它
+    const bl = $('#wzBuiltinMode');
+    if (bl) {
+      const isGo = s.backend === 'go';
+      bl.classList.toggle('hide', !isGo);
+      const radio = bl.querySelector('input');
+      if (radio) {
+        radio.onchange = wzSyncMode;
+        if (isGo && !wzFilled) { radio.checked = true; wzSyncMode(); }
+      }
+    }
     $('#ovBanner').innerHTML = s.initialized ? '' :
       '<div class="box" style="margin-top:0">' +
       '<h2>尚未初始化</h2>' +
