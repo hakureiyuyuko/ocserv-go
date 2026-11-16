@@ -178,6 +178,7 @@ docker run -d --name ocserv-go -p 443:443 -p 443:443/udp \
 | `-style` | `asa` | 登录风格：`asa`（模拟 Cisco ASA）或 `ocserv`（标准 XML） |
 | `-dtls` | true | 启用 DTLS 数据面 |
 | `-dtls-port` | 同 `-addr` | DTLS 端口 |
+| `-assets` | `/etc/ocserv-go/assets` | 用户上传的 Cisco 登录页资源目录（图片/CSS/logon.html） |
 | `-icmp-echo` | true | 客户端 ping 由服务端本地应答（echo reply，延迟 = 客户端到网关 RTT）；`false` 则不代答 |
 | `-http` | false | 明文 HTTP 预览模式（仅看页面） |
 | `-v` | false | 详细日志 |
@@ -351,6 +352,43 @@ sudo ocserv-go panel -config /etc/ocserv-go/panel.json     # 默认 :19999
   "vpnDns": ["1.1.1.1"]
 }
 ```
+
+### 登录页外观（素材由用户自己提供）
+
+套件**不自带**任何 Cisco 图片 / CSS（厂商素材，不随仓库分发）。想还原手上设备的外观，
+可以自己从设备抓取后打包上传：
+
+```bash
+# 在与你设备同网段的一台 Linux/macOS 上执行，BASE 换成设备地址
+BASE=https://192.168.1.1
+for p in /+CSCOE+/logon.html /+CSCOE+/logon_custom.css /+CSCOE+/win.js \
+         /+CSCOU+/csco_logo.gif /+CSCOU+/login-header-icon.jpg \
+         /+CSCOU+/login-header-middle.jpg /+CSCOU+/login-header-end.jpg; do
+  mkdir -p ".$(dirname "$p")"
+  curl -sk "$BASE$p" -o ".$p" || true
+done
+tar czf cisco-assets.tar.gz +CSCOE+ +CSCOU+
+```
+
+然后在面板「登录页外观」页上传这个包（或 `POST /api/assets`，multipart 字段名 `file`）。
+
+服务端行为：
+
+- 先查 `/etc/ocserv-go/assets/<路径>`（即 `-assets` 目录），命中就直接回文件（自动按扩展名给
+  Content-Type、带 1 小时缓存）；
+- 没命中就回内置占位（1×1 像素图、最小 CSS）；
+- 如果包里有 `+CSCOE+/logon.html`，**整页替换**登录页（表单字段仍需 `username` / `password`，
+  POST 到 `/+webvpn+/index.html`，与本套件兼容）；
+- 只接受 `+CSCOT+` / `+CSCOU+` / `+CSCOE+` 下的路径；拒绝绝对路径、`..`、软链、设备文件；
+  总量 ≤ 32MB、单文件 ≤ 8MB、文件数 ≤ 500。
+
+面板接口：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/assets` | 列出已导入文件、是否含 logon.html、限额 |
+| POST | `/api/assets` | 上传 `.tar.gz`（字段 `file`）并解包 |
+| DELETE | `/api/assets` | 清空，恢复内置占位页 |
 
 ### 前端开发
 

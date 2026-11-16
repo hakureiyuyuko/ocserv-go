@@ -198,7 +198,8 @@ fi
 mkdir -p /etc/ocserv-go
 chmod 700 /etc/ocserv-go
 
-ARGS="-addr :$PORT -users $USERS -cert $CERT -key $KEY -net $NET -ip $IP -dns $DNS -mtu $MTU -domain $DOMAIN"
+ASSETS=/etc/ocserv-go/assets
+ARGS="-addr :$PORT -users $USERS -cert $CERT -key $KEY -net $NET -ip $IP -dns $DNS -mtu $MTU -domain $DOMAIN -assets $ASSETS"
 
 # ---------------------------------------------------------------- 服务单元
 say "服务单元"
@@ -268,7 +269,8 @@ if [ ! -f "$PANEL_CFG" ]; then
   "vpnPort": $PORT,
   "vpnNet": "$NET",
   "vpnMtu": $MTU,
-  "vpnDns": ["$(printf '%s' "$DNS" | cut -d, -f1)"]
+  "vpnDns": ["$(printf '%s' "$DNS" | cut -d, -f1)"],
+  "assetsDir": "$ASSETS"
 }
 JSON
   chmod 600 "$PANEL_CFG"

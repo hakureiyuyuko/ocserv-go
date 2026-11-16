@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/hakureiyuyuko/ocserv-go/internal/acme"
+	"github.com/hakureiyuyuko/ocserv-go/internal/assets"
 )
 
 // Panel 是管理面板（API + 内嵌前端）。
@@ -53,6 +54,9 @@ func (p *Panel) Handler() http.Handler {
 	mux.HandleFunc("POST /api/users", p.withAuth(p.handleUsersPost))
 	mux.HandleFunc("POST /api/service", p.withAuth(p.handleService))
 	mux.HandleFunc("GET /api/logs", p.withAuth(p.handleLogs))
+	mux.HandleFunc("GET /api/assets", p.withAuth(p.handleAssetsGet))
+	mux.HandleFunc("POST /api/assets", p.withAuth(p.handleAssetsUpload))
+	mux.HandleFunc("DELETE /api/assets", p.withAuth(p.handleAssetsClear))
 	mux.HandleFunc("GET /api/cert", p.withAuth(p.handleCertInfo))
 	mux.HandleFunc("POST /api/cert", p.withAuth(p.handleCertPost))
 	mux.HandleFunc("GET /api/config", p.withAuth(p.handleConfigGet))
@@ -214,6 +218,55 @@ func (p *Panel) handleService(w http.ResponseWriter, r *http.Request, _ string) 
 func (p *Panel) handleLogs(w http.ResponseWriter, r *http.Request, _ string) {
 	n, _ := strconv.Atoi(r.URL.Query().Get("lines"))
 	writeJSON(w, http.StatusOK, map[string]any{"text": p.Logs(n)})
+}
+
+// ---- 登录页外观（用户自己上传的 Cisco 资源）----
+
+func (p *Panel) handleAssetsGet(w http.ResponseWriter, _ *http.Request, _ string) {
+	files := assets.List(p.cfg.AssetsDir)
+	hasLogon := false
+	for _, f := range files {
+		if strings.EqualFold(f.Path, "+CSCOE+/logon.html") {
+			hasLogon = true
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"dir": p.cfg.AssetsDir, "files": files, "count": len(files), "hasLogon": hasLogon,
+		"limits": map[string]any{"maxTotalMB": assets.MaxTotalSize >> 20, "maxFileMB": assets.MaxFileSize >> 20, "maxFiles": assets.MaxFiles},
+	})
+}
+
+func (p *Panel) handleAssetsUpload(w http.ResponseWriter, r *http.Request, _ string) {
+	// 限制请求体，避免超大上传把内存/磁盘打满
+	r.Body = http.MaxBytesReader(w, r.Body, assets.MaxTotalSize+(1<<20))
+	if err := r.ParseMultipartForm(8 << 20); err != nil {
+		fail(w, http.StatusBadRequest, "解析上传内容失败（需要 multipart/form-data，字段名 file）: "+err.Error())
+		return
+	}
+	f, hdr, err := r.FormFile("file")
+	if err != nil {
+		fail(w, http.StatusBadRequest, "没有收到文件（字段名应为 file）")
+		return
+	}
+	defer f.Close()
+	if !strings.HasSuffix(strings.ToLower(hdr.Filename), ".tar.gz") && !strings.HasSuffix(strings.ToLower(hdr.Filename), ".tgz") {
+		fail(w, http.StatusBadRequest, "请上传 .tar.gz / .tgz 包")
+		return
+	}
+	files, err := assets.Extract(f, p.cfg.AssetsDir)
+	if err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "files": files, "count": len(files)})
+}
+
+func (p *Panel) handleAssetsClear(w http.ResponseWriter, _ *http.Request, _ string) {
+	if err := assets.Clear(p.cfg.AssetsDir); err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // ---- 证书 ----

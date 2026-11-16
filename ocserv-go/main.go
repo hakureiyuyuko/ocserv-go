@@ -35,6 +35,7 @@ import (
 	"github.com/hakureiyuyuko/ocserv-go/internal/acme"
 	"github.com/hakureiyuyuko/ocserv-go/internal/acxml"
 	"github.com/hakureiyuyuko/ocserv-go/internal/asa"
+	"github.com/hakureiyuyuko/ocserv-go/internal/assets"
 	"github.com/hakureiyuyuko/ocserv-go/internal/auth"
 	"github.com/hakureiyuyuko/ocserv-go/internal/cstp"
 	"github.com/hakureiyuyuko/ocserv-go/internal/dtlsx"
@@ -62,6 +63,7 @@ var (
 	dtlsOn     = flag.Bool("dtls", true, "启用 DTLS（UDP 数据面，与 TCP 同端口）")
 	dtlsPort   = flag.Int("dtls-port", 0, "DTLS 端口（默认与 -addr 相同）")
 	showVer    = flag.Bool("version", false, "显示版本后退出")
+	assetsDir  = flag.String("assets", "/etc/ocserv-go/assets", "用户上传的 Cisco 登录页资源目录（图片/CSS/logon.html）")
 	icmpEcho   = flag.Bool("icmp-echo", true, "本地应答客户端的 ICMP ping（返回客户端到网关的延迟；false 则透传/丢弃）")
 	acmeOnce   = flag.Bool("acme-once", false, "申请/续期证书后退出（DNS-01，内置 lego）")
 	acmeDomain = flag.String("acme-domain", "", "ACME 域名（-acme-once 时必填）")
@@ -95,22 +97,23 @@ func withSession(ctx context.Context, c net.Conn) context.Context {
 }
 
 type server struct {
-	users    *auth.Users
-	certHash string
-	icmpEcho bool
-	pendMu   sync.Mutex
-	pend     map[string]pendEntry
-	pool     *ippool.Pool
-	dials    usrnet.DialFunc
-	mtu      int
-	dpd      time.Duration
-	dns      []string
-	prefix   int
-	serverIP net.IP
-	domain   string
-	style    string
-	secure   bool // 是否 TLS（决定 cookie 是否带 Secure）
-	start    time.Time
+	users     *auth.Users
+	certHash  string
+	assetsDir string
+	icmpEcho  bool
+	pendMu    sync.Mutex
+	pend      map[string]pendEntry
+	pool      *ippool.Pool
+	dials     usrnet.DialFunc
+	mtu       int
+	dpd       time.Duration
+	dns       []string
+	prefix    int
+	serverIP  net.IP
+	domain    string
+	style     string
+	secure    bool // 是否 TLS（决定 cookie 是否带 Secure）
+	start     time.Time
 
 	tokensMu sync.Mutex
 	tokens   map[string]string // webvpn cookie → 用户名
@@ -142,6 +145,7 @@ type serverConfig struct {
 	DTLS      bool
 	DTLSPort  int
 	CertHash  string
+	AssetsDir string
 	ICMPEcho  bool
 	Dial      usrnet.DialFunc
 }
@@ -157,22 +161,23 @@ func newServer(c serverConfig) (*server, error) {
 		c.MTU = 1400
 	}
 	s := &server{
-		users:    c.Users,
-		pool:     pool,
-		mtu:      c.MTU,
-		dpd:      time.Duration(c.DPD) * time.Second,
-		dns:      c.DNS,
-		prefix:   ones,
-		certHash: c.CertHash,
-		icmpEcho: c.ICMPEcho,
-		serverIP: net.ParseIP(c.ServerIP),
-		domain:   c.Domain,
-		style:    c.Style,
-		start:    time.Now(),
-		tokens:   make(map[string]string),
-		tunnels:  make(map[string]*tunnel),
-		dtlsWant: c.DTLS,
-		dtlsPort: c.DTLSPort,
+		users:     c.Users,
+		pool:      pool,
+		mtu:       c.MTU,
+		dpd:       time.Duration(c.DPD) * time.Second,
+		dns:       c.DNS,
+		prefix:    ones,
+		certHash:  c.CertHash,
+		assetsDir: c.AssetsDir,
+		icmpEcho:  c.ICMPEcho,
+		serverIP:  net.ParseIP(c.ServerIP),
+		domain:    c.Domain,
+		style:     c.Style,
+		start:     time.Now(),
+		tokens:    make(map[string]string),
+		tunnels:   make(map[string]*tunnel),
+		dtlsWant:  c.DTLS,
+		dtlsPort:  c.DTLSPort,
 	}
 	if s.dtlsPort == 0 {
 		if _, ps, err := net.SplitHostPort(c.Addr); err == nil {
@@ -243,6 +248,7 @@ func main() {
 		DTLS:      *dtlsOn && !*httpOnly,
 		DTLSPort:  *dtlsPort,
 		CertHash:  certHashHex,
+		AssetsDir: *assetsDir,
 		ICMPEcho:  *icmpEcho,
 		Dial:      buildDialer(*socksAddr),
 	})
@@ -473,15 +479,18 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 		s.handleInit(w, r, body)
 	case p == "/+CSCOE+/logon.html":
 		if r.Method == http.MethodGet {
+			if f, ok := assets.Lookup(s.assetsDir, p); ok {
+				w.Header().Set("Content-Type", assets.ContentType(f))
+				w.Header().Set("Cache-Control", "no-cache")
+				http.ServeFile(w, r, f)
+				return
+			}
 			s.handleLogonPage(w, r, "")
 			return
 		}
 		s.handleLogonSubmit(w, r)
 	case p == "/+CSCOE+/portal.html":
 		s.handlePortal(w, r)
-	case p == "/+CSCOE+/logon_custom.css":
-		w.Header().Set("Content-Type", "text/css; charset=utf-8")
-		_, _ = w.Write([]byte("/* ocserv-go */\n"))
 	case p == "/+webvpn+/index.html":
 		if r.Method == http.MethodGet {
 			s.handleASALoginPage(w, r)
@@ -506,6 +515,15 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 
 // serveASAStatic 复刻真机会被扫描器探测的静态资源路径（内容是自绘的占位）。
 func (s *server) serveASAStatic(w http.ResponseWriter, r *http.Request, p string) bool {
+	// 用户自己上传的 Cisco 资源优先（我们不自带厂商素材）
+	if r.Method == http.MethodGet {
+		if f, ok := assets.Lookup(s.assetsDir, p); ok {
+			w.Header().Set("Content-Type", assets.ContentType(f))
+			w.Header().Set("Cache-Control", "public, max-age=3600")
+			http.ServeFile(w, r, f)
+			return true
+		}
+	}
 	// 真 ocserv 对这些路径回 200 + 一个小 XML（worker-http-handlers.c get_string_handler），
 	// 回 404 会让真 AnyConnect 客户端在隧道建立后立刻重连。
 	xmlVpn := "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<vpn rev=\"1.0\">\n</vpn>\n"

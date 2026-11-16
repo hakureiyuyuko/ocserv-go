@@ -38,6 +38,25 @@ export const api = {
   service: (action) => req('POST', '/api/service', { action }),
   logs: (lines = 200) => req('GET', `/api/logs?lines=${lines}`),
 
+  assets: () => req('GET', '/api/assets'),
+  clearAssets: () => req('DELETE', '/api/assets'),
+  async uploadAssets(file) {
+    const fd = new FormData()
+    fd.append('file', file)
+    const r = await fetch('/api/assets', {
+      method: 'POST',
+      headers: { 'X-Panel': '1' },
+      body: fd,
+      credentials: 'same-origin'
+    })
+    let data = null
+    try {
+      data = await r.json()
+    } catch (e) {}
+    if (!r.ok) throw new ApiError(r.status, (data && data.error) || `HTTP ${r.status}`)
+    return data
+  },
+
   cert: () => req('GET', '/api/cert'),
   selfSigned: (domain) => req('POST', '/api/cert', { action: 'selfsigned', domain }),
   uploadCert: (domain, cert, key) => req('POST', '/api/cert', { action: 'upload', domain, cert, key }),
