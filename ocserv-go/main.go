@@ -94,6 +94,8 @@ func withSession(ctx context.Context, c net.Conn) context.Context {
 
 type server struct {
 	users    *auth.Users
+	pendMu   sync.Mutex
+	pend     map[string]pendEntry
 	pool     *ippool.Pool
 	dials    usrnet.DialFunc
 	mtu      int
@@ -440,13 +442,10 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 			s.handleRootGET(w, r)
 			return
 		}
+		// 任意风格的 POST /：真 AnyConnect 的聚合认证首包就是 POST / + <config-auth type="init">，
+		// 回 ocserv 同款的两步式表单（先要用户名），真机客户端才认。
 		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-		if s.style == "ocserv" {
-			s.handleInit(w, r, body)
-			return
-		}
-		// ASA 聚合认证：真 AnyConnect 的首包就是 POST / + <config-auth type="init">
-		s.handleAggregateAuth(w, r, body)
+		s.handleInit(w, r, body)
 	case p == "/+CSCOE+/logon.html":
 		if r.Method == http.MethodGet {
 			s.handleLogonPage(w, r, "")
@@ -575,62 +574,28 @@ func (s *server) handleASALoginPage(w http.ResponseWriter, r *http.Request) {
 func (s *server) handleASASubmit(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if b := bytes.TrimSpace(body); len(b) > 0 && b[0] == '<' {
-		s.handleAggregateAuth(w, r, body)
+		s.handleAuth(w, r, body)
 		return
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	s.doLogin(w, r)
 }
 
-// handleAggregateAuth 处理 ASA 聚合认证（POST / 或 /+webvpn+/index.html 的 config-auth XML）。
-// 协议：init → auth-request（要用户名密码）→ auth-reply（带凭据）→ auth-reply/auth id="success"。
-func (s *server) handleAggregateAuth(w http.ResponseWriter, r *http.Request, body []byte) {
-	ca, err := acxml.Parse(body)
-	if err != nil {
-		// 不是 XML（老客户端/浏览器表单）：原样交给表单处理
-		r.Body = io.NopCloser(bytes.NewReader(body))
-		s.doLogin(w, r)
-		return
-	}
-	user, pass := ca.Credentials()
-	if user == "" {
-		s.writeASAXML(w, acxml.ASARequestLogin())
-		return
-	}
-	// 把客户端提交的原文记下来（密码打码），排障时一眼看出到底收到什么
-	log.Printf("AC 聚合认证: type=%s client=%s user=%q passLen=%d body=%s",
-		ca.Type, ca.Client, user, len(pass), maskPass(body))
-	if !s.users.Verify(user, pass) {
-		log.Printf("认证失败: %s", user)
-		s.writeASAXML(w, acxml.ASALoginFailed("Login failed."))
-		return
-	}
-	tok := asa.NewToken()
-	s.tokensMu.Lock()
-	s.tokens[tok] = user
-	s.tokensMu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "webvpn", Value: tok, Path: "/", Secure: s.secure, HttpOnly: true})
-	if sess := sessionOf(r.Context()); sess != nil {
-		sess.mu.Lock()
-		sess.user, sess.authed = user, true
-		sess.mu.Unlock()
-	}
-	log.Printf("认证成功: %s（聚合认证）", user)
-	s.writeASAXML(w, acxml.ASASuccess())
-}
-
 // maskPass 把 XML 里的密码打码，其余原样（排障日志用）。
+// 注意：打完码后 <password> 标签仍在，必须从打码位置之后继续找，否则死循环。
 func maskPass(b []byte) string {
 	s := string(b)
 	if len(s) > 1200 {
 		s = s[:1200] + "…"
 	}
 	low := strings.ToLower(s)
+	off := 0
 	for {
-		i := strings.Index(low, "<password>")
+		i := strings.Index(low[off:], "<password>")
 		if i < 0 {
 			break
 		}
+		i += off
 		j := strings.Index(low[i:], "</password>")
 		if j < 0 {
 			break
@@ -638,18 +603,9 @@ func maskPass(b []byte) string {
 		j += i
 		s = s[:i+len("<password>")] + "***" + s[j:]
 		low = strings.ToLower(s)
+		off = i + len("<password>") + 3
 	}
 	return s
-}
-
-// writeASAXML 是聚合认证响应的固定头（真 ASA 会带 X-Aggregate-Auth: 1）。
-func (s *server) writeASAXML(w http.ResponseWriter, body []byte) {
-	h := w.Header()
-	h.Set("Content-Type", "text/xml; charset=utf-8")
-	h.Set("X-Transcend-Version", "1")
-	h.Set("X-Aggregate-Auth", "1")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(body)
 }
 
 // handleLogonPage 渲染浏览器登录页。
@@ -735,7 +691,9 @@ func (s *server) tokenUser(tok string) (string, bool) {
 }
 
 func writeXML(w http.ResponseWriter, body []byte) {
-	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	// 与真 ocserv 一致：text/xml + X-Transcend-Version（真 AnyConnect 认这个组合）
+	w.Header().Set("Content-Type", "text/xml")
+	w.Header().Set("X-Transcend-Version", "1")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
@@ -755,24 +713,36 @@ func (s *server) handleInit(w http.ResponseWriter, r *http.Request, body []byte)
 
 func (s *server) handleAuth(w http.ResponseWriter, r *http.Request, body []byte) {
 	sess := sessionOf(r.Context())
-	if sess == nil {
-		http.Error(w, "no session", http.StatusBadRequest)
-		return
-	}
 	ca, err := acxml.Parse(body)
 	if err != nil {
-		writeXML(w, acxml.Failure("Login failed (bad request)."))
+		writeXML(w, acxml.RequestUsername())
 		return
 	}
 	user, pass := ca.Credentials()
+
+	// 真 ocserv / 真 AnyConnect 是两步式：先发用户名，再只发密码；
+	// 用户名靠 webvpncontext cookie 记住（客户端可能在新连接上发第二步）。
+	tok := ""
+	if c, cerr := r.Cookie("webvpncontext"); cerr == nil {
+		tok = c.Value
+	}
+	if user == "" && tok != "" {
+		user = s.pendUser(tok)
+	}
 	if user == "" {
-		writeXML(w, acxml.Failure("Please enter your username."))
+		writeXML(w, acxml.RequestUsername())
 		return
 	}
-	sess.mu.Lock()
-	sess.user = user
-	sess.gotUser = true
-	sess.mu.Unlock()
+	if tok == "" {
+		tok = asa.NewToken()
+	}
+	http.SetCookie(w, &http.Cookie{Name: "webvpncontext", Value: tok, Path: "/", Secure: s.secure, HttpOnly: true})
+	s.pendSet(tok, user)
+	if sess != nil {
+		sess.mu.Lock()
+		sess.user, sess.gotUser = user, true
+		sess.mu.Unlock()
+	}
 
 	// 还没给密码 → 继续要密码
 	if pass == "" {
@@ -780,16 +750,61 @@ func (s *server) handleAuth(w http.ResponseWriter, r *http.Request, body []byte)
 		return
 	}
 
+	// 记下客户端提交的原文（密码打码），排障用
+	log.Printf("AC 认证: type=%s client=%s user=%q passLen=%d body=%s",
+		ca.Type, ca.Client, user, len(pass), maskPass(body))
 	if !s.users.Verify(user, pass) {
 		log.Printf("认证失败: %s", user)
-		writeXML(w, acxml.Failure("Login failed."))
+		writeXML(w, acxml.RequestPassword()) // 与真机一致：重发密码表单
 		return
 	}
-	sess.mu.Lock()
-	sess.authed = true
-	sess.mu.Unlock()
+	token := asa.NewToken()
+	s.tokensMu.Lock()
+	s.tokens[token] = user
+	s.tokensMu.Unlock()
+	http.SetCookie(w, &http.Cookie{Name: "webvpn", Value: token, Path: "/", Secure: s.secure, HttpOnly: true})
+	if sess != nil {
+		sess.mu.Lock()
+		sess.authed = true
+		sess.mu.Unlock()
+	}
 	log.Printf("认证成功: %s", user)
 	writeXML(w, acxml.Success())
+}
+
+// ---- 两步式认证的待定用户名（按 webvpncontext cookie 存，5 分钟过期）----
+
+type pendEntry struct {
+	user string
+	exp  time.Time
+}
+
+func (s *server) pendSet(tok, user string) {
+	if tok == "" {
+		return
+	}
+	now := time.Now()
+	s.pendMu.Lock()
+	if s.pend == nil {
+		s.pend = make(map[string]pendEntry)
+	}
+	for k, v := range s.pend {
+		if v.exp.Before(now) {
+			delete(s.pend, k)
+		}
+	}
+	s.pend[tok] = pendEntry{user: user, exp: now.Add(5 * time.Minute)}
+	s.pendMu.Unlock()
+}
+
+func (s *server) pendUser(tok string) string {
+	s.pendMu.Lock()
+	defer s.pendMu.Unlock()
+	e, ok := s.pend[tok]
+	if !ok || e.exp.Before(time.Now()) {
+		return ""
+	}
+	return e.user
 }
 
 func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {

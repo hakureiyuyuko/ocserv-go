@@ -149,60 +149,49 @@ func loginForm(action string) *Form {
 	}
 }
 
-// RequestUsername 返回首包的登录请求（要用户名）。
+// RequestUsername 返回首包的登录请求（要用户名）。输出与真机 ocserv 字节一致：
+// 两步式（先用户名、再密码），action 指向 /auth。
 func RequestUsername() []byte {
-	b, _ := marshal(&ConfigAuth{
-		Client:  "vpn",
-		Type:    "auth-request",
-		Version: &Version{Who: "sg", Value: "0.1(1)"},
-		Auth: &Auth{
-			ID:      "main",
-			Message: "Please enter your username.",
-			Form:    loginForm("/auth"),
-		},
-	})
-	return b
+	return []byte(xmlHeader + `<config-auth client="vpn" type="auth-request">
+<version who="sg">0.1(1)</version>
+<auth id="main">
+<message>Please enter your username.</message>
+<form method="post" action="/auth">
+<input type="text" name="username" label="Username:" />
+</form></auth>
+</config-auth>`)
 }
 
 // RequestPassword 表示用户名已收到，继续要密码。
 func RequestPassword() []byte {
-	b, _ := marshal(&ConfigAuth{
-		Client:  "vpn",
-		Type:    "auth-reply",
-		Version: &Version{Who: "sg", Value: "0.1(1)"},
-		Auth: &Auth{
-			ID:      "main",
-			Message: "Please enter your password.",
-			Form:    loginForm("/auth"),
-		},
-	})
-	return b
+	return []byte(xmlHeader + `<config-auth client="vpn" type="auth-request">
+<version who="sg">0.1(1)</version>
+<auth id="main">
+<message>Please enter your password.</message>
+<form method="post" action="/auth">
+<input type="password" name="password" label="Password:" />
+</form></auth>
+</config-auth>`)
 }
 
 // Success 表示认证通过。extra 里可放 <config> 之类的扩展节点（暂不用）。
 func Success() []byte {
-	b, _ := marshal(&ConfigAuth{
-		Client: "vpn",
-		Type:   "auth-reply",
-		Auth:   &Auth{ID: "success"},
-	})
-	return b
+	return []byte(xmlHeader + `<config-auth client="vpn" type="auth-reply">
+<auth id="success"></auth>
+</config-auth>`)
 }
 
-// Failure 返回认证失败（消息会显示在客户端）。
+// Failure 返回认证失败（重发用户名表单，与 ocserv 一致）。
 func Failure(msg string) []byte {
 	if msg == "" {
-		msg = "Login failed."
+		msg = "Please enter your username."
 	}
-	b, _ := marshal(&ConfigAuth{
-		Client:  "vpn",
-		Type:    "auth-reply",
-		Version: &Version{Who: "sg", Value: "0.1(1)"},
-		Auth: &Auth{
-			ID:      "main",
-			Message: msg,
-			Form:    loginForm("/auth"),
-		},
-	})
-	return b
+	return []byte(xmlHeader + `<config-auth client="vpn" type="auth-request">
+<version who="sg">0.1(1)</version>
+<auth id="main">
+<message>` + escapeXML(msg) + `</message>
+<form method="post" action="/auth">
+<input type="text" name="username" label="Username:" />
+</form></auth>
+</config-auth>`)
 }

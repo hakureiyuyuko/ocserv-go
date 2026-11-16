@@ -44,8 +44,8 @@ func TestResponses(t *testing.T) {
 		body []byte
 		want []string
 	}{
-		"username": {RequestUsername(), []string{`type="auth-request"`, `id="main"`, "username", "password"}},
-		"password": {RequestPassword(), []string{`type="auth-reply"`, "Please enter your password."}},
+		"username": {RequestUsername(), []string{`type="auth-request"`, `id="main"`, "username", `action="/auth"`}},
+		"password": {RequestPassword(), []string{`type="auth-request"`, "Please enter your password.", `name="password"`}},
 		"success":  {Success(), []string{`id="success"`}},
 		"failure":  {Failure("nope"), []string{"nope"}},
 	}
