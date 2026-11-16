@@ -24,6 +24,8 @@ const net = require('net');
 const tls = require('tls');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
+// 服务管理器抽象（systemd / OpenRC）：启动早期就会用到，必须最先加载
+const SVC = require('./lib/svc');
 
 const BASE       = __dirname;
 const CONF_FILE  = path.join(BASE, 'config.json');
@@ -502,7 +504,6 @@ const DNS_PROVIDERS = [
 function tpl(name) { return readText(path.join(TPL_DIR, name), null); }
 // 纯函数(模板渲染 / 网段换算 / systemd 单元)集中在 lib/tpl.js，便于脱离 Linux 单独测试
 const TPL = require('./lib/tpl');
-const SVC = require('./lib/svc');
 const fillTpl = TPL.fillTpl;
 function tailOf(r, n) { return String(((r && r.out) || '') + ((r && r.err) || '')).trim().split('\n').slice(-(n || 8)).join('\n'); }
 function writeAs(p, data, mode) {
@@ -525,7 +526,8 @@ async function setupStatus() {
   const st = await ocservStatus();
   const en = (await SVC.enabled(CFG.ocservService)) || '';
   return {
-    initialized: hasConf && cert.exists,
+    // Go 后端没有 ocserv.conf，初始化的判据是「证书就绪 + 服务能起」
+    initialized: CFG.backend === 'go' ? !!cert.exists : (hasConf && cert.exists),
     hasConf, certExists: cert.exists, cert,
     service: { active: st.active, sub: st.SubState, enabled: en.trim(), version: st.version },
     backend: CFG.backend || 'ocserv',
