@@ -154,3 +154,20 @@ func TestCleanName(t *testing.T) {
 		}
 	}
 }
+
+// 包里混入 README/.DS_Store 之类的杂项时应忽略，而不是整体失败。
+func TestExtractIgnoresExtraFiles(t *testing.T) {
+	dir := t.TempDir()
+	buf := makeTarGz(t, map[string]string{
+		"+CSCOU+/a.gif": "a",
+		"README.txt":    "hello",
+		"__MACOSX/._a":  "junk",
+	}, "")
+	files, err := Extract(buf, dir)
+	if err != nil {
+		t.Fatalf("杂项不应导致失败: %v", err)
+	}
+	if len(files) != 1 || files[0].Path != "+CSCOU+/a.gif" {
+		t.Fatalf("只应导入官方目录下的文件: %+v", files)
+	}
+}

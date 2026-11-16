@@ -104,13 +104,12 @@ func Extract(r io.Reader, dir string) ([]File, error) {
 		}
 		name, err := CleanName(h.Name)
 		if err != nil {
-			return nil, err
+			// 非官方目录的文件（README、.DS_Store、__MACOSX/…）直接忽略，
+			// 不要因为包里多带了几个杂项就让整个上传失败。
+			continue
 		}
-		if !allowedTop(name) {
-			// 允许根级 index.html，其余忽略
-			if name != "index.html" {
-				continue
-			}
+		if !allowedTop(name) && name != "index.html" {
+			continue
 		}
 		if h.Size > MaxFileSize {
 			return nil, fmt.Errorf("%s 超过单文件上限 (%d MB)", name, MaxFileSize>>20)
