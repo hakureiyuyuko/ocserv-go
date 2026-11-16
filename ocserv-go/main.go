@@ -597,6 +597,9 @@ func (s *server) handleAggregateAuth(w http.ResponseWriter, r *http.Request, bod
 		s.writeASAXML(w, acxml.ASARequestLogin())
 		return
 	}
+	// 把客户端提交的原文记下来（密码打码），排障时一眼看出到底收到什么
+	log.Printf("AC 聚合认证: type=%s client=%s user=%q passLen=%d body=%s",
+		ca.Type, ca.Client, user, len(pass), maskPass(body))
 	if !s.users.Verify(user, pass) {
 		log.Printf("认证失败: %s", user)
 		s.writeASAXML(w, acxml.ASALoginFailed("Login failed."))
@@ -614,6 +617,29 @@ func (s *server) handleAggregateAuth(w http.ResponseWriter, r *http.Request, bod
 	}
 	log.Printf("认证成功: %s（聚合认证）", user)
 	s.writeASAXML(w, acxml.ASASuccess())
+}
+
+// maskPass 把 XML 里的密码打码，其余原样（排障日志用）。
+func maskPass(b []byte) string {
+	s := string(b)
+	if len(s) > 1200 {
+		s = s[:1200] + "…"
+	}
+	low := strings.ToLower(s)
+	for {
+		i := strings.Index(low, "<password>")
+		if i < 0 {
+			break
+		}
+		j := strings.Index(low[i:], "</password>")
+		if j < 0 {
+			break
+		}
+		j += i
+		s = s[:i+len("<password>")] + "***" + s[j:]
+		low = strings.ToLower(s)
+	}
+	return s
 }
 
 // writeASAXML 是聚合认证响应的固定头（真 ASA 会带 X-Aggregate-Auth: 1）。
