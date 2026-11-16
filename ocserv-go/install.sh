@@ -23,7 +23,7 @@
 # ============================================================================
 set -eu
 
-VERSION="1.1.1"
+VERSION="1.1.2"
 SRC=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 DOMAIN="vpn.example.com"
@@ -340,7 +340,12 @@ echo "    用户库: $USERS"
 echo "    证书:   $CERT"
 echo
 echo "  客户端连接: 任意 AnyConnect 兼容客户端 → $DOMAIN:$PORT"
-echo "  管理面板:   http://<本机IP>:$PANEL_PORT/  (systemctl status $SVC-panel)"
+case "$INIT" in
+  systemd) PANEL_STATUS_HINT="systemctl status $SVC-panel" ;;
+  openrc)  PANEL_STATUS_HINT="rc-service $SVC-panel status" ;;
+  *)       PANEL_STATUS_HINT="面板未托管（手动运行）" ;;
+esac
+echo "  管理面板:   http://<本机IP>:$PANEL_PORT/  ($PANEL_STATUS_HINT)"
 echo
 echo "  换正式证书（内置 Let's Encrypt DNS-01，无需 80 端口）:"
 echo "    cat > /etc/ocserv-go/acme.env <<'EOF'"

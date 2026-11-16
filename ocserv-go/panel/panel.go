@@ -30,6 +30,8 @@ type Panel struct {
 	sessions *sessions
 	version  string
 	web      http.Handler
+	sup      *Supervisor // 非 nil = 容器模式：面板自己托管 VPN 子进程
+	init     InitKind    // systemd / openrc / none（构造时按环境探测）
 }
 
 // New 构造面板。version 会显示在页面上。
@@ -39,8 +41,18 @@ func New(cfg *Config, version string) *Panel {
 		sessions: newSessions(),
 		version:  version,
 		web:      newWebHandler(),
+		init:     DetectInit(cfg.Service),
 	}
 }
+
+// Supervise 让面板托管 VPN 子进程（容器/无 systemd 环境用）。
+func (p *Panel) Supervise(s *Supervisor) { p.sup = s }
+
+// Supervised 报告是否处于托管模式。
+func (p *Panel) Supervised() bool { return p.sup != nil }
+
+// SetInit 覆盖探测结果（测试或显式指定用）。
+func (p *Panel) SetInit(k InitKind) { p.init = k }
 
 // Config 返回当前配置（只读用）。
 func (p *Panel) Config() *Config { return p.cfg }
@@ -378,7 +390,7 @@ func (p *Panel) handleCertPost(w http.ResponseWriter, r *http.Request, _ string)
 			fail(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		if err := selfSigned(domain, certFile, keyFile); err != nil {
+		if err := SelfSigned(domain, certFile, keyFile); err != nil {
 			fail(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -477,7 +489,8 @@ func (p *Panel) handleConfigGet(w http.ResponseWriter, _ *http.Request, _ string
 	writeJSON(w, http.StatusOK, map[string]any{
 		"domain": p.cfg.Domain, "vpnPort": p.cfg.VPNPort, "vpnNet": p.cfg.VPNNet,
 		"vpnMtu": p.cfg.VPNMTU, "vpnDns": p.cfg.VPNDNS,
-		"unit": p.cfg.RenderUnit(),
+		// 托管模式没有服务脚本（参数直接交给子进程），OpenRC/systemd 展示对应文本
+		"unit": p.ServiceScript(), "mode": p.ModeName(),
 	})
 }
 
@@ -523,8 +536,8 @@ func (p *Panel) handleConfigPost(w http.ResponseWriter, r *http.Request, _ strin
 		fail(w, http.StatusInternalServerError, "保存配置失败: "+err.Error())
 		return
 	}
-	if err := p.cfg.WriteUnit(); err != nil {
-		fail(w, http.StatusInternalServerError, "写入 systemd 单元失败: "+err.Error())
+	if err := p.WriteService(); err != nil {
+		fail(w, http.StatusInternalServerError, "写入服务脚本失败: "+err.Error())
 		return
 	}
 	if in.Apply {
@@ -533,7 +546,7 @@ func (p *Panel) handleConfigPost(w http.ResponseWriter, r *http.Request, _ strin
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "unit": p.cfg.RenderUnit()})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "unit": p.ServiceScript(), "mode": p.ModeName()})
 }
 
 // ---- 面板自身 ----
@@ -578,7 +591,8 @@ func (p *Panel) handlePanelPassword(w http.ResponseWriter, r *http.Request, user
 
 // ---- 自签证书 ----
 
-func selfSigned(domain, certFile, keyFile string) error {
+// SelfSigned 生成自签 RSA 证书（Cisco DTLS 要求 RSA）并写盘。
+func SelfSigned(domain, certFile, keyFile string) error {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return err

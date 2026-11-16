@@ -5,6 +5,7 @@ import { api } from '../api'
 const say = inject('toast')
 const form = ref({ domain: '', vpnPort: 443, vpnNet: '10.66.66.0/24', vpnMtu: 1400, vpnDnsText: '1.1.1.1' })
 const unit = ref('')
+const mode = ref('systemd')
 const busy = ref(false)
 
 async function load() {
@@ -18,6 +19,7 @@ async function load() {
       vpnDnsText: (c.vpnDns || []).join(', ')
     }
     unit.value = c.unit || ''
+    mode.value = c.mode || 'systemd'
   } catch (e) {
     say(e.message, 'err')
   }
@@ -72,12 +74,21 @@ onMounted(load)
     <div class="row" style="margin-top:14px">
       <button :disabled="busy" @click="save(false)">仅保存</button>
       <button class="primary" :disabled="busy" @click="save(true)">保存并重启服务</button>
-      <span class="muted">保存会重写 systemd 单元；重启会断开在线用户</span>
+      <span v-if="mode === 'container'" class="muted">容器托管模式：参数保存在 panel.json，点「保存并重启服务」立即生效</span>
+      <span v-else-if="mode === 'openrc'" class="muted">保存会重写 OpenRC 脚本（/etc/init.d/）；重启会断开在线用户</span>
+      <span v-else class="muted">保存会重写 systemd 单元；重启会断开在线用户</span>
     </div>
   </div>
 
   <div class="card">
-    <h2>生成的 systemd 单元</h2>
-    <pre class="log">{{ unit }}</pre>
+    <h2>{{ mode === 'container' ? '运行方式' : mode === 'openrc' ? '生成的 OpenRC 脚本' : '生成的 systemd 单元' }}</h2>
+    <p v-if="mode === 'container'" class="muted" style="margin:0">
+      当前是托管模式：面板自己管理 VPN 进程（start / stop / restart 都直接作用于子进程），
+      参数保存在面板配置文件里，不依赖 systemd / OpenRC。容器重启后由入口脚本再次托管。
+    </p>
+    <p v-else-if="mode === 'openrc'" class="muted" style="margin:0 0 8px">
+      Alpine 等 OpenRC 系统：保存会写入 /etc/init.d/ 并加入 default 运行级。
+    </p>
+    <pre v-if="mode !== 'container'" class="log">{{ unit }}</pre>
   </div>
 </template>

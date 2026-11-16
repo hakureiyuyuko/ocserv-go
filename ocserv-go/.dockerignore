@@ -1,2 +1,10 @@
-bin/
+# 构建上下文就是 ocserv-go/：只要源码（含已入库的 panel/webdist）
 .git
+bin/
+dist/
+*.tar.gz
+*.zip
+*.log
+*.pem
+*.key
+*.env

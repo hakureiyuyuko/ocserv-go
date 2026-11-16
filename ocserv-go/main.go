@@ -43,7 +43,7 @@ import (
 	"github.com/hakureiyuyuko/ocserv-go/internal/usrnet"
 )
 
-const version = "1.1.1"
+const version = "1.1.2"
 
 var (
 	addr        = flag.String("addr", ":443", "监听地址")
@@ -215,6 +215,11 @@ func main() {
 		os.Exit(runPanel())
 	}
 
+	// 子命令：生成自签证书（容器首次启动用）
+	if flag.Arg(0) == "self-signed" {
+		os.Exit(runSelfSigned())
+	}
+
 	// 子命令：哈希
 	if flag.Arg(0) == "hash" {
 		pw := flag.Arg(1)
@@ -337,6 +342,8 @@ func usage() {
 用法:
   ocserv-go -users users.txt -addr :443 [-cert cert.pem -key key.pem] [选项]
   ocserv-go hash <密码>          # 生成用户文件里用的 bcrypt 哈希
+  ocserv-go panel [选项]         # 内置管理面板（-supervise 为容器托管模式）
+  ocserv-go self-signed -domain vpn.example.com [-cert ... -key ...]
 
 选项:
 `)

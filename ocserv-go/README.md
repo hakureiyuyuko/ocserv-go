@@ -9,6 +9,16 @@ go build -o bin/ocserv-go .
 go test ./...
 ```
 
+## 容器镜像
+
+```bash
+docker build -t ocserv-go .            # Alpine 多阶段构建，约 25MB
+docker run --rm ocserv-go -version
+```
+
+容器里没有 systemd，入口脚本用 `ocserv-go panel -supervise` 托管 VPN 子进程（面板里能
+启动/停止/重启、看日志）。详见仓库根 README 的「Docker」一节。
+
 ## 包职责
 
 | 包 | 内容 |
@@ -22,6 +32,7 @@ go test ./...
 | `internal/usrnet` | gVisor netstack：注入 IP 包、TCP/UDP 转发（进程内出网） |
 | `internal/ippool` | 客户端地址池 |
 | `internal/acme` | 内置 Let's Encrypt DNS-01（lego：cloudflare/alidns/tencentcloud/dnspod） |
+| `panel` | 管理面板 API + 内嵌前端；`supervisor.go` 是容器模式下的 VPN 进程托管器 |
 
 ## 几个容易踩的点
 

@@ -1,0 +1,45 @@
+# ocserv-go 容器部署示例：docker compose up -d --build
+#
+# 数据都在 ./data/ 下（对应容器里 /etc/ocserv-go、/etc/ocserv、/etc/ssl/securev），
+# 备份/迁移直接打包这个目录即可。
+#
+# 首次启动在日志里打印：VPN 用户密码、面板 admin 密码。
+#   docker compose logs -f | head -40
+#
+# 之后改参数请到面板「设置」页（值持久化在 data/ocserv-go/panel.json），
+# 下面这些环境变量只在首次启动时生效。
+
+services:
+  ocserv-go:
+    build: ./ocserv-go
+    image: ghcr.io/hakureiyuyuko/ocserv-go:latest
+    container_name: ocserv-go
+    restart: unless-stopped
+    ports:
+      - "443:443/tcp"    # CSTP（AnyConnect 登录 + TCP 数据面）
+      - "443:443/udp"    # DTLS 数据面（没有这条就只能跑 TCP）
+      - "127.0.0.1:19999:19999"  # 管理面板，仅本机；需要远程用 SSH 隧道或反代
+    volumes:
+      - ./data/ocserv-go:/etc/ocserv-go
+      - ./data/ocserv:/etc/ocserv
+      - ./data/certs:/etc/ssl/securev
+    environment:
+      DOMAIN: vpn.example.com
+      VPN_PORT: "443"
+      VPN_NET: 10.66.66.0/24
+      VPN_DNS: 1.1.1.1,8.8.8.8
+      VPN_MTU: "1400"
+      PANEL: "1"
+      TZ: Asia/Shanghai
+      # 首次启动想指定密码就用下面两个（不给则随机生成并打印）
+      # VPN_PASSWORD: change-me-please
+      # PANEL_PASSWORD: change-me-please
+    security_opt:
+      - no-new-privileges:true
+    # 可选加固：gVisor 用户态栈不需要任何 capability。
+    # 但绑定 443 需要 CAP_NET_BIND_SERVICE，所以要么把 VPN_PORT 改成 4443，
+    # 要么放开非特权端口下限（下面两项同时启用）：
+    # sysctls:
+    #   net.ipv4.ip_unprivileged_port_start: "0"
+    # cap_drop:
+    #   - ALL

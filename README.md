@@ -4,13 +4,14 @@
 数据面换成 **gVisor 用户态 TCP/IP 栈** —— 所以**不需要 `/dev/net/tun`、不需要 `NET_ADMIN`、
 不需要 `iptables` / `ip_forward`**，无特权 LXC / Docker / PaaS 里都能跑。
 
-> 当前版本 **1.1.1**。本仓库只包含 Go 版服务端与管理面板；
+> 当前版本 **1.1.2**。本仓库只包含 Go 版服务端与管理面板；
 > C 版 ocserv 部署套件在另一个仓库：[ocserv-deploy-kit](https://github.com/hakureiyuyuko/ocserv-deploy-kit)。
 
 ## 仓库结构
 
 ```
-ocserv-go/          # Go 服务端源码（main.go、internal/、install.sh、Dockerfile）
+ocserv-go/          # Go 服务端源码（main.go、internal/、install.sh、Dockerfile、docker/entrypoint.sh）
+docker-compose.yml  # 容器部署示例（数据挂到 ./data/）
 ocserv-go/panel/    # 内置管理面板（Go API + 前端构建产物 webdist/，go:embed 进二进制）
 web/                # 面板前端源码（Vue 3 + Vite）
 .github/            # CI：推 v* tag 自动出双架构包并发布 Release
@@ -63,16 +64,16 @@ ocserv-go
 
 ### 0. 用发行包安装（推荐）
 
-从 [Releases](https://github.com/hakureiyuyuko/ocserv-deploy-kit/releases) 下载对应架构：
+从 [Releases](https://github.com/hakureiyuyuko/ocserv-go/releases) 下载对应架构：
 
 ```
-ocserv-go-1.1.1-linux-amd64.tar.gz     # x86_64
-ocserv-go-1.1.1-linux-arm64.tar.gz     # aarch64
+ocserv-go-1.1.2-linux-amd64.tar.gz     # x86_64
+ocserv-go-1.1.2-linux-arm64.tar.gz     # aarch64
 ```
 
 ```bash
-tar xzf ocserv-go-1.1.1-linux-amd64.tar.gz
-cd ocserv-go-1.1.1-linux-amd64
+tar xzf ocserv-go-1.1.2-linux-amd64.tar.gz
+cd ocserv-go-1.1.2-linux-amd64
 sudo ./install.sh --domain vpn.example.com --user alice
 ```
 
@@ -136,18 +137,71 @@ ocserv-go -acme-once -acme-domain vpn.example.com -acme-dns cloudflare …
   -mtu 1400 -dpd 30
 ```
 
-### 5. 无特权 Docker
+### 5. Docker（Alpine 最小镜像，约 25 MB）
 
 ```bash
-docker build -t ocserv-go:dev ocserv-go
-docker run -d --name ocserv-go -p 443:443 -p 443:443/udp \
-  -v "$PWD/users.txt:/data/users.txt:ro" \
-  -v "$PWD/certs:/certs:ro" \
-  ocserv-go:dev -addr :443 -users /data/users.txt \
-  -cert /certs/fullchain.pem -key /certs/privkey.pem
+docker build -t ocserv-go ./ocserv-go
+docker compose up -d                      # 用仓库根的 docker-compose.yml
+docker compose logs -f | head -40         # 首次启动会打印 VPN 密码与面板 admin 密码
 ```
 
-注意：**没有** `--privileged`、**没有** `--device /dev/net/tun`、**没有** `--cap-add`。
+镜像里只有静态二进制 + `ca-certificates` + `tzdata`。**不需要** `--privileged`、
+**不需要** `--device /dev/net/tun`、**不需要** `--cap-add`、**不需要** `ip_forward`。
+
+容器里没有 systemd（面板也会自动探测），入口脚本显式用**面板托管模式**跑，行为最确定：
+
+```
+PID 1  ocserv-go panel -supervise     # 内置面板 + 托管 VPN 子进程
+  └──  ocserv-go -addr :443 ...       # 真正的 VPN 进程（随面板启动/重启）
+```
+
+面板的「启动 / 停止 / 重启」直接作用于子进程，3 秒自动拉起；「服务日志」读子进程输出
+（同一份内容也写进 `docker logs`）。「服务配置」保存后点「保存并重启服务」即时生效。
+
+| 端口 | 用途 |
+|---|---|
+| 443/tcp | CSTP：登录 + TCP 数据面 |
+| 443/udp | DTLS 数据面（不放行就只能跑 TCP） |
+| 19999/tcp | 管理面板（建议只绑 `127.0.0.1`，用 SSH 隧道或反代访问） |
+
+数据都在挂载目录里，备份/迁移直接打包：
+
+| 容器路径 | 内容 |
+|---|---|
+| `/etc/ocserv-go` | 面板配置 `panel.json`、连接日志、ACME 状态与凭据、登录页素材 |
+| `/etc/ocserv` | 用户库 `ocpasswd` |
+| `/etc/ssl/securev` | 证书（按域名分目录） |
+
+首次启动的环境变量（**只在 `panel.json` 不存在时生效**，之后请到面板「设置」里改）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `DOMAIN` | `vpn.example.com` | 域名（自签证书 CN/SAN，证书目录按它命名） |
+| `VPN_PORT` | `443` | VPN 端口 |
+| `VPN_NET` | `10.66.66.0/24` | 客户端网段（服务端取第一个地址） |
+| `VPN_IP` | 网段第一个 | 手动指定隧道内服务端地址 |
+| `VPN_DNS` | `1.1.1.1,8.8.8.8` | 下发 DNS |
+| `VPN_MTU` | `1400` | 隧道 MTU |
+| `VPN_USER` / `VPN_PASSWORD` | `admin` / 随机 | 首个 VPN 用户（仅用户库为空时创建） |
+| `PANEL` | `1` | `0` = 只跑 VPN，不启动面板（此时按上面的变量直接传参） |
+| `PANEL_LISTEN` | `:19999` | 面板监听地址（改端口时把 `PANEL_PORT` 一起改，健康检查用它） |
+| `PANEL_USER` / `PANEL_PASSWORD` | `admin` / 随机 | 面板账号（仅首次初始化） |
+| `TZ` | `Asia/Shanghai` | 日志时区 |
+
+补一个用户（不用进容器）：
+
+```bash
+docker exec ocserv-go ocserv-go hash '新密码'   # 打印 bcrypt 哈希
+# 或者直接进面板「VPN 用户」添加（热加载，不用重启）
+```
+
+加固：gVisor 用户态栈不需要任何 capability。若把 `VPN_PORT` 改成 4443，
+可以加 `--cap-drop ALL --security-opt no-new-privileges`；绑 443 则需要
+`CAP_NET_BIND_SERVICE`，或把 `net.ipv4.ip_unprivileged_port_start` 设为 0
+（`docker-compose.yml` 里有注释好的写法）。镜像默认以 root 运行，只是为了绑 443。
+
+升级：`docker compose pull && docker compose up -d --build`，数据在挂载目录里不会丢。
+多架构：`docker buildx build --platform linux/amd64,linux/arm64 -t ... --push ./ocserv-go`。
 
 ### 6. 浏览器预览（只看页面）
 
@@ -337,6 +391,18 @@ sudo ocserv-go panel -config /etc/ocserv-go/panel.json     # 默认 :19999
 安装脚本会自动完成这些事：生成 `/etc/ocserv-go/panel.json`、建一个 `admin` 账号并打印随机密码、
 写 `ocserv-go-panel.service` 并开机自启。
 
+面板会自己探测环境再决定怎么管 VPN，不用手选：
+
+| 环境 | 判定依据 | 服务控制 | 服务日志 | 「服务配置」保存 |
+|---|---|---|---|---|
+| systemd | `systemctl` 且 `/run/systemd/system` 存在 | `systemctl start/stop/restart` | `journalctl -u ocserv-go` | 重写 systemd 单元 |
+| OpenRC（Alpine） | `rc-service`、`/run/openrc` 存在且 `/etc/init.d/<服务>` 存在 | `rc-service ocserv-go ...` | `/var/log/ocserv-go.log` | 重写 `/etc/init.d/ocserv-go` 并加入 `default` 运行级 |
+| 都没有（精简容器） | 以上都不满足 | **自动进入托管模式**：面板自己拉起/重启 VPN 子进程 | 子进程输出（同时也在 `docker logs`） | 参数存进 `panel.json`，不写 init 脚本 |
+
+所以在裸容器里直接跑 `ocserv-go panel` 也不会再出现
+`start 失败: exec: "systemctl": executable file not found in $PATH` —— 没有 init 系统就自动托管。
+想强制托管（比如容器里同时装了 openrc 包）加 `-supervise`。
+
 命令行参数：
 
 | 参数 | 说明 |
@@ -344,7 +410,9 @@ sudo ocserv-go panel -config /etc/ocserv-go/panel.json     # 默认 :19999
 | `-config` | 配置文件（默认 `/etc/ocserv-go/panel.json`） |
 | `-listen` | 监听地址，覆盖配置 |
 | `-init` | 只生成/保存配置后退出（安装脚本用） |
-| `-set-password user:pw` | 重置面板账号密码 |
+| `-set-password user:pw` | 重置面板账号密码（配 `-init` 一起用则改完退出） |
+| `-supervise` | **容器模式**：面板自己托管 VPN 子进程，不依赖 systemd / journalctl（镜像入口即用这个） |
+| `-resanitize` | 对已上传的 `+CSCOE+/*.html` 重新脱敏后退出 |
 | `-import <旧配置>` | 从旧 Node 面板的 `config.json` 迁移端口/账号/证书路径（旧面板密码是 scrypt，本面板会兼容校验，无需重设） |
 
 面板功能：
@@ -353,9 +421,10 @@ sudo ocserv-go panel -config /etc/ocserv-go/panel.json     # 默认 :19999
 - **VPN 用户**：增删用户、重置密码（写 `ocpasswd`，**改完立即生效**，靠文件热加载）
 - **证书**：查看当前证书、自签、上传 PEM、内置 Let's Encrypt（DNS-01）
 - **服务配置**：域名/端口/网段/MTU/DNS → 重写 systemd 单元并可一键重启
+  （容器模式下没有单元，参数存进 `panel.json`，重启的是托管子进程）
 - **连接日志**：只有**连接成功**的会话才会记录（时间 / 用户 / 来源 IP / 归属地 / 运营商 ASN），
   支持搜索与 10 秒自动刷新
-- **日志**：`journalctl -u ocserv-go`（可自动刷新）
+- **日志**：`journalctl -u ocserv-go`；容器模式读子进程输出（同时也在 `docker logs` 里）
 - **面板设置**：改面板密码、查看路径
 
 配置文件示例（`/etc/ocserv-go/panel.json`，0600）：
@@ -500,7 +569,9 @@ ocserv-go/
 │   ├── usrnet/          # gVisor 用户态栈 + TCP/UDP 代理
 │   ├── ippool/          # 客户端地址池
 │   └── acme/            # 内置 Let's Encrypt（lego）
-├── Dockerfile           # 无特权镜像
+├── panel/supervisor.go  # 容器模式：面板托管 VPN 子进程（无 systemd）
+├── docker/entrypoint.sh # 容器入口：首启建证书/用户/面板配置，然后托管运行
+├── Dockerfile           # Alpine 最小镜像（多阶段构建，CGO_ENABLED=0）
 └── README.md            # 包级说明（指向本文件）
 ```
 
@@ -511,7 +582,7 @@ ocserv-go/
 - [ ] CSTP 压缩
 - [ ] split 路由（按用户/组）
 - [ ] 带宽限制与在线审计
-- [ ] 多架构镜像与 CI（构建 + `go test`）
+- [x] 多架构镜像与 CI（Alpine 最小镜像 + `go test`）
 - [ ] 面板里显示内置 ACME 的账号/到期信息
 
 ## 许可

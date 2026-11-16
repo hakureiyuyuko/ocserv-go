@@ -27,3 +27,6 @@ dist/
 
 # 前端依赖（构建产物 panel/webdist 需要入库，因为它被 go:embed 打进二进制）
 node_modules/
+
+# docker compose 挂载出来的运行数据（含证书/用户库/面板配置）
+/data/

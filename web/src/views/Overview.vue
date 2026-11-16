@@ -40,7 +40,10 @@ onMounted(load)
         <div style="font-size:22px;margin:6px 0">
           <span class="tag" :class="o.service.active === 'active' ? 'ok' : 'err'">{{ o.service.active }}</span>
         </div>
-        <div class="muted mono">{{ o.service.name }} · enabled={{ o.service.enabled }}</div>
+        <div class="muted mono">
+          {{ o.service.name }} ·
+          {{ o.service.enabled === 'container' ? '容器托管（面板管理进程）' : 'enabled=' + o.service.enabled }}
+        </div>
       </div>
       <div class="card">
         <div class="muted">证书</div>
