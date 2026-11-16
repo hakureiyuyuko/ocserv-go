@@ -367,6 +367,8 @@ for p in /+CSCOE+/logon.html /+CSCOE+/logon_custom.css /+CSCOE+/win.js \
   mkdir -p ".$(dirname "$p")"
   curl -sk "$BASE$p" -o ".$p" || true
 done
+# 抬头蓝色 Banner 的背景图（缺了它 Banner 是空白的）
+curl -sk "$BASE/+CSCOU+/gradient.gif?r=255&g=255&b=255" -o ".+CSCOU+/gradient.gif" || true
 tar czf cisco-assets.tar.gz +CSCOE+ +CSCOU+
 ```
 
@@ -377,6 +379,8 @@ tar czf cisco-assets.tar.gz +CSCOE+ +CSCOU+
 - 先查 `/etc/ocserv-go/assets/<路径>`（即 `-assets` 目录），命中就直接回文件（自动按扩展名给
   Content-Type、带 1 小时缓存）；
 - 没命中就回内置占位（1×1 像素图、最小 CSS）；
+- 登录页抬头 Banner 靠 `+CSCOU+/login-header-*.jpg` + `+CSCOU+/gradient.gif`（真机页面里写作
+  `gradient.gif?r=255&g=255&b=255`，抓取要带 query，存成 `gradient.gif` 即可）；
 - 如果包里有 `+CSCOE+/logon.html`，**整页替换**登录页（表单字段仍需 `username` / `password`，
   POST 到 `/+webvpn+/index.html`，与本套件兼容）；
 - 只接受 `+CSCOT+` / `+CSCOU+` / `+CSCOE+` 下的路径；拒绝绝对路径、`..`、软链、设备文件；

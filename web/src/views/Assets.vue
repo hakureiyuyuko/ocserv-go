@@ -19,6 +19,8 @@ const fetchScript = computed(() => {
     '  mkdir -p ".$(dirname "$p")"',
     '  curl -sk "$BASE$p" -o ".$p" || true',
     'done',
+    '# 抬头蓝色 Banner 的背景图（缺了它 Banner 会是空白）',
+    'curl -sk "$BASE/+CSCOU+/gradient.gif?r=255&g=255&b=255" -o ".+CSCOU+/gradient.gif" || true',
     'tar czf cisco-assets.tar.gz +CSCOE+ +CSCOU+'
   ].join('\n')
 })
