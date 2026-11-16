@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/scrypt"
 )
 
 // Credential 是面板账号的加盐 SHA-256 摘要（与旧 Node 面板格式一致，可直接迁移）。
@@ -246,10 +248,33 @@ func HashPassword(pw string) Credential {
 }
 
 // VerifyPassword 校验密码（常数时间比较）。
+//
+// 兼容两种摘要：
+//   - 本面板：加盐 SHA-256（64 个 hex 字符）
+//   - 旧 Node 面板：crypto.scryptSync(pw, salt, 64)（128 个 hex 字符，N=16384,r=8,p=1）
+//
+// 这样从旧面板迁移过来的账号不用重设密码。
 func VerifyPassword(pw string, c Credential) bool {
-	sum := sha256.Sum256([]byte(c.Salt + pw))
-	return subtle.ConstantTimeCompare([]byte(hex.EncodeToString(sum[:])), []byte(c.Hash)) == 1
+	if c.Hash == "" || c.Salt == "" {
+		return false
+	}
+	var got string
+	switch len(c.Hash) {
+	case 128:
+		k, err := scrypt.Key([]byte(pw), []byte(c.Salt), 16384, 8, 1, 64)
+		if err != nil {
+			return false
+		}
+		got = hex.EncodeToString(k)
+	default:
+		sum := sha256.Sum256([]byte(c.Salt + pw))
+		got = hex.EncodeToString(sum[:])
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(c.Hash)) == 1
 }
+
+// IsLegacyScrypt 判断这条凭据是否来自旧 Node 面板（scrypt）。
+func (c Credential) IsLegacyScrypt() bool { return len(c.Hash) == 128 }
 
 // PanelUsersNames 返回面板账号名（排序后），用于日志展示。
 func (c *Config) PanelUsersNames() []string {

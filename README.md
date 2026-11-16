@@ -323,7 +323,7 @@ sudo ocserv-go panel -config /etc/ocserv-go/panel.json     # 默认 :19999
 | `-listen` | 监听地址，覆盖配置 |
 | `-init` | 只生成/保存配置后退出（安装脚本用） |
 | `-set-password user:pw` | 重置面板账号密码 |
-| `-import <旧配置>` | 从旧 Node 面板的 `config.json` 迁移端口/账号/证书路径 |
+| `-import <旧配置>` | 从旧 Node 面板的 `config.json` 迁移端口/账号/证书路径（旧面板密码是 scrypt，本面板会兼容校验，无需重设） |
 
 面板功能：
 

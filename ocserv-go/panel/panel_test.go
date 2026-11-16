@@ -1,10 +1,13 @@
 package panel
 
 import (
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/scrypt"
 )
 
 func TestHashVerify(t *testing.T) {
@@ -137,5 +140,30 @@ func TestCertInfoOf(t *testing.T) {
 	}
 	if ci.DaysLeft < 300 {
 		t.Fatalf("自签证书有效期应为 ~365 天，剩 %d", ci.DaysLeft)
+	}
+}
+
+// 旧 Node 面板用 scrypt 存密码，迁移后必须还能验证。
+func TestVerifyLegacyScrypt(t *testing.T) {
+	pw := "svw817899"
+	salt := "0123456789abcdef"
+	k, err := scrypt.Key([]byte(pw), []byte(salt), 16384, 8, 1, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred := Credential{Salt: salt, Hash: hex.EncodeToString(k)}
+	if !cred.IsLegacyScrypt() {
+		t.Fatal("应识别为 legacy scrypt")
+	}
+	if !VerifyPassword(pw, cred) {
+		t.Fatal("scrypt 摘要应能通过校验")
+	}
+	if VerifyPassword("wrong", cred) {
+		t.Fatal("错误密码不应通过")
+	}
+	// 本面板新写入的仍是 sha256，且必须能验证
+	nc := HashPassword("newpw123")
+	if nc.IsLegacyScrypt() || !VerifyPassword("newpw123", nc) {
+		t.Fatal("新格式校验失败")
 	}
 }
