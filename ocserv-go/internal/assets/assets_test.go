@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -169,5 +170,47 @@ func TestExtractIgnoresExtraFiles(t *testing.T) {
 	}
 	if len(files) != 1 || files[0].Path != "+CSCOU+/a.gif" {
 		t.Fatalf("只应导入官方目录下的文件: %+v", files)
+	}
+}
+
+func TestSanitizeLogonHTML(t *testing.T) {
+	in := `<html><body>
+<select name="tgroup"><option value="Corp_VPN" selected>Corp_VPN</option>
+<option value="Guest_WiFi">Guest_WiFi</option></select>
+<input type="hidden" name="group_list" value="Corp_VPN,Guest_WiFi">
+<script>var groups = ["Corp_VPN","Guest_WiFi"];</script>
+<form action="/+webvpn+/index.html"><input name="username"><input name="password"></form>
+</body></html>`
+	out := string(SanitizeLogonHTML([]byte(in)))
+	for _, banned := range []string{"Corp_VPN", "Guest_WiFi", "group_list"} {
+		if strings.Contains(out, banned) {
+			t.Fatalf("脱敏后仍含 %q:\n%s", banned, out)
+		}
+	}
+	for _, keep := range []string{`<select name="tgroup">`, `name="username"`, `name="password"`, "/+webvpn+/index.html"} {
+		if !strings.Contains(out, keep) {
+			t.Fatalf("脱敏不应破坏 %q:\n%s", keep, out)
+		}
+	}
+}
+
+func TestExtractSanitizesLogon(t *testing.T) {
+	dir := t.TempDir()
+	buf := makeTarGz(t, map[string]string{
+		"+CSCOE+/logon.html":    `<html><select name="tgroup"><option value="Corp_VPN">Corp_VPN</option></select><input name="username"></html>`,
+		"+CSCOU+/csco_logo.gif": "GIF89a",
+	}, "")
+	if _, err := Extract(buf, dir); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "+CSCOE+", "logon.html"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "Corp_VPN") {
+		t.Fatalf("写入磁盘的 logon.html 仍含组名:\n%s", b)
+	}
+	if !strings.Contains(string(b), `name="username"`) {
+		t.Fatal("不应影响其它表单字段")
 	}
 }

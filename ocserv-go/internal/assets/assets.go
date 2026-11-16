@@ -10,10 +10,13 @@ import (
 	"compress/gzip"
 	"errors"
 	"fmt"
+	"html"
 	"io"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -130,12 +133,28 @@ func Extract(r io.Reader, dir string) ([]File, error) {
 		if err != nil {
 			return nil, err
 		}
-		n, err := io.Copy(f, io.LimitReader(tr, MaxFileSize+1))
-		cerr := f.Close()
-		if err != nil {
-			return nil, fmt.Errorf("写入 %s 失败: %v", name, err)
+		var n int64
+		if needsSanitize(name) {
+			raw, rerr := io.ReadAll(io.LimitReader(tr, MaxFileSize+1))
+			if rerr != nil {
+				_ = f.Close()
+				return nil, fmt.Errorf("读取 %s 失败: %v", name, rerr)
+			}
+			clean := SanitizeLogonHTML(raw)
+			if _, werr := f.Write(clean); werr != nil {
+				_ = f.Close()
+				return nil, fmt.Errorf("写入 %s 失败: %v", name, werr)
+			}
+			n = int64(len(clean))
+		} else {
+			var cerr error
+			n, cerr = io.Copy(f, io.LimitReader(tr, MaxFileSize+1))
+			if cerr != nil {
+				_ = f.Close()
+				return nil, fmt.Errorf("写入 %s 失败: %v", name, cerr)
+			}
 		}
-		if cerr != nil {
+		if cerr := f.Close(); cerr != nil {
 			return nil, cerr
 		}
 		if n > MaxFileSize {
@@ -244,4 +263,59 @@ func ContentType(p string) string {
 		return "font/ttf"
 	}
 	return "application/octet-stream"
+}
+
+// ---- 脱敏：登录页里的组名 ----
+
+var (
+	reOption     = regexp.MustCompile(`(?is)<option\b[^>]*>(.*?)</option>`)
+	reOptionVal  = regexp.MustCompile(`(?i)value\s*=\s*["']([^"']*)["']`)
+	reGroupInput = regexp.MustCompile(`(?is)<input\b[^>]*name\s*=\s*["']?group_list["']?[^>]*>`)
+)
+
+// SanitizeLogonHTML 去掉页面里暴露的「组名」信息。
+//
+// Cisco 登录页会把设备上配置的连接组（group）以 <option> 形式写进页面，
+// 传上来就等于把对方（或自己）的内部组名公开到登录页。这里：
+//   - 删除所有 <option>…</option>（组名选项），保留 <select> 本身（值为空，
+//     服务端本来就忽略 tgroup）；
+//   - 删除 group_list 隐藏域；
+//   - 再把从 option 里提取到的组名，在全文其它位置一并清掉（含 URL 转义形式）。
+func SanitizeLogonHTML(b []byte) []byte {
+	s := string(b)
+
+	// 先收集组名，后面全文清理
+	var names []string
+	for _, m := range reOption.FindAllStringSubmatch(s, -1) {
+		if v := strings.TrimSpace(m[1]); v != "" {
+			names = append(names, html.UnescapeString(v))
+		}
+		if vm := reOptionVal.FindStringSubmatch(m[0]); vm != nil {
+			if v := strings.TrimSpace(html.UnescapeString(vm[1])); v != "" {
+				names = append(names, v)
+			}
+		}
+	}
+
+	s = reOption.ReplaceAllString(s, "")
+	s = reGroupInput.ReplaceAllString(s, "")
+
+	for _, n := range names {
+		if len(n) < 3 { // 太短的不替换，避免误伤
+			continue
+		}
+		s = strings.ReplaceAll(s, html.EscapeString(n), "")
+		s = strings.ReplaceAll(s, n, "")
+		s = strings.ReplaceAll(s, url.PathEscape(n), "")
+	}
+	return []byte(s)
+}
+
+// needsSanitize 判断某个包内文件是否需要脱敏（+CSCOE+ 下的 HTML）。
+func needsSanitize(name string) bool {
+	if !strings.HasPrefix(strings.ToLower(name), "+cscoe+/") {
+		return false
+	}
+	low := strings.ToLower(name)
+	return strings.HasSuffix(low, ".html") || strings.HasSuffix(low, ".htm")
 }
