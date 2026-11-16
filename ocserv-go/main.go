@@ -32,14 +32,14 @@ import (
 
 	"golang.org/x/net/proxy"
 
-	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/acme"
-	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/acxml"
-	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/asa"
-	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/auth"
-	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/cstp"
-	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/dtlsx"
-	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/ippool"
-	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/usrnet"
+	"github.com/hakureiyuyuko/ocserv-go/internal/acme"
+	"github.com/hakureiyuyuko/ocserv-go/internal/acxml"
+	"github.com/hakureiyuyuko/ocserv-go/internal/asa"
+	"github.com/hakureiyuyuko/ocserv-go/internal/auth"
+	"github.com/hakureiyuyuko/ocserv-go/internal/cstp"
+	"github.com/hakureiyuyuko/ocserv-go/internal/dtlsx"
+	"github.com/hakureiyuyuko/ocserv-go/internal/ippool"
+	"github.com/hakureiyuyuko/ocserv-go/internal/usrnet"
 )
 
 const version = "1.0.0"
@@ -62,6 +62,7 @@ var (
 	dtlsOn     = flag.Bool("dtls", true, "启用 DTLS（UDP 数据面，与 TCP 同端口）")
 	dtlsPort   = flag.Int("dtls-port", 0, "DTLS 端口（默认与 -addr 相同）")
 	showVer    = flag.Bool("version", false, "显示版本后退出")
+	icmpEcho   = flag.Bool("icmp-echo", true, "本地应答客户端的 ICMP ping（返回客户端到网关的延迟；false 则透传/丢弃）")
 	acmeOnce   = flag.Bool("acme-once", false, "申请/续期证书后退出（DNS-01，内置 lego）")
 	acmeDomain = flag.String("acme-domain", "", "ACME 域名（-acme-once 时必填）")
 	acmeEmail  = flag.String("acme-email", "", "ACME 账号邮箱（可空）")
@@ -96,6 +97,7 @@ func withSession(ctx context.Context, c net.Conn) context.Context {
 type server struct {
 	users    *auth.Users
 	certHash string
+	icmpEcho bool
 	pendMu   sync.Mutex
 	pend     map[string]pendEntry
 	pool     *ippool.Pool
@@ -140,6 +142,7 @@ type serverConfig struct {
 	DTLS      bool
 	DTLSPort  int
 	CertHash  string
+	ICMPEcho  bool
 	Dial      usrnet.DialFunc
 }
 
@@ -161,6 +164,7 @@ func newServer(c serverConfig) (*server, error) {
 		dns:      c.DNS,
 		prefix:   ones,
 		certHash: c.CertHash,
+		icmpEcho: c.ICMPEcho,
 		serverIP: net.ParseIP(c.ServerIP),
 		domain:   c.Domain,
 		style:    c.Style,
@@ -234,6 +238,7 @@ func main() {
 		DTLS:      *dtlsOn && !*httpOnly,
 		DTLSPort:  *dtlsPort,
 		CertHash:  certHashHex,
+		ICMPEcho:  *icmpEcho,
 		Dial:      buildDialer(*socksAddr),
 	})
 	if err != nil {
@@ -1090,10 +1095,11 @@ func (s *server) tunnel(ctx context.Context, conn net.Conn, br *bufio.Reader, us
 	defer cancel()
 
 	st, err := usrnet.New(ctx, usrnet.Options{
-		MTU:       s.mtu,
-		ServerIP:  s.serverIP,
-		PrefixLen: s.prefix,
-		Dial:      s.dials,
+		MTU:           s.mtu,
+		ServerIP:      s.serverIP,
+		PrefixLen:     s.prefix,
+		Dial:          s.dials,
+		ICMPEchoReply: s.icmpEcho,
 	})
 	if err != nil {
 		log.Printf("网络栈启动失败: %v", err)

@@ -1,4 +1,4 @@
-module github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go
+module github.com/hakureiyuyuko/ocserv-go
 
 go 1.26.3
 

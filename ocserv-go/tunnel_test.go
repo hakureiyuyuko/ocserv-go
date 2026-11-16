@@ -26,8 +26,8 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 
-	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/auth"
-	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/cstp"
+	"github.com/hakureiyuyuko/ocserv-go/internal/auth"
+	"github.com/hakureiyuyuko/ocserv-go/internal/cstp"
 )
 
 // TestTunnelTCP 走完整协议栈：认证 → CONNECT → CSTP 隧道 → 客户端 gVisor 栈

@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/auth"
-	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/cstp"
+	"github.com/hakureiyuyuko/ocserv-go/internal/auth"
+	"github.com/hakureiyuyuko/ocserv-go/internal/cstp"
 )
 
 // TestASAStyle 覆盖模拟 Cisco ASA 的完整 webvpn 流程：

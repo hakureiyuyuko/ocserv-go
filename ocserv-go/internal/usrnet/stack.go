@@ -47,17 +47,22 @@ type Options struct {
 	ServerIP  net.IP // 栈内服务端地址，例如 10.66.66.1
 	PrefixLen int    // 例如 24
 	Dial      DialFunc
+	// ICMPEchoReply 为 true 时，客户端发来的 ICMP echo 请求直接由服务端
+	// 本地应答（回 echo reply，源地址就是被 ping 的地址）。
+	// 这样应用测到的延迟是「客户端 ↔ 网关」的 RTT。
+	ICMPEchoReply bool
 }
 
 // Stack 是一个客户端专属的用户态网络栈。
 type Stack struct {
-	s      *stack.Stack
-	ep     *channel.Endpoint
-	out    chan []byte
-	dial   DialFunc
-	ctx    context.Context
-	cancel context.CancelFunc
-	once   sync.Once
+	s        *stack.Stack
+	ep       *channel.Endpoint
+	out      chan []byte
+	dial     DialFunc
+	ctx      context.Context
+	cancel   context.CancelFunc
+	once     sync.Once
+	icmpEcho bool
 }
 
 // New 创建并启动一个栈。
@@ -101,10 +106,11 @@ func New(ctx context.Context, o Options) (*Stack, error) {
 	s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: nicID}})
 
 	st := &Stack{
-		s:    s,
-		ep:   ep,
-		out:  make(chan []byte, 256),
-		dial: o.Dial,
+		s:        s,
+		ep:       ep,
+		out:      make(chan []byte, 256),
+		dial:     o.Dial,
+		icmpEcho: o.ICMPEchoReply,
 	}
 	st.ctx, st.cancel = context.WithCancel(ctx)
 
@@ -211,6 +217,10 @@ func (st *Stack) Inject(b []byte) error {
 	if b[0]>>4 != 4 {
 		return fmt.Errorf("暂只支持 IPv4（收到版本 %d）", b[0]>>4)
 	}
+	// ICMP echo（ping）：开启时直接本地应答，不去真实目的地
+	if st.icmpEcho && st.replyICMPEcho(b) {
+		return nil
+	}
 	if debug && len(b) >= 20 {
 		dbg("收到 IP 包: %s -> %s proto=%d len=%d", net.IP(b[12:16]), net.IP(b[16:20]), b[9], len(b))
 	}
@@ -220,6 +230,55 @@ func (st *Stack) Inject(b []byte) error {
 	defer pkt.DecRef()
 	st.ep.InjectInbound(header.IPv4ProtocolNumber, pkt)
 	return nil
+}
+
+// replyICMPEcho 判断是否为 ICMPv4 echo request，是则构造 echo reply 直接回给客户端，
+// 返回 true 表示已处理（调用方不要再把原包送进栈）。
+//
+// 语义：客户端 ping 任何地址都能立刻得到应答，应用测到的延迟 = 客户端到网关的 RTT。
+func (st *Stack) replyICMPEcho(b []byte) bool {
+	if len(b) < 28 {
+		return false
+	}
+	ihl := int(b[0]&0x0f) * 4
+	if ihl < 20 || len(b) < ihl+8 {
+		return false
+	}
+	if b[9] != 1 { // IPv4 protocol = ICMP
+		return false
+	}
+	if b[ihl] != 8 || b[ihl+1] != 0 { // type 8 = echo request, code 0
+		return false
+	}
+
+	out := make([]byte, len(b))
+	copy(out, b)
+
+	// 交换源/目的地址：回复的 source 就是被 ping 的地址
+	copy(out[12:16], b[16:20])
+	copy(out[16:20], b[12:16])
+	out[8] = 64             // TTL
+	out[10], out[11] = 0, 0 // 先清零 IP 头校验和
+
+	ip := header.IPv4(out[:ihl])
+	ip.SetChecksum(0)
+	ip.SetChecksum(^ip.CalculateChecksum())
+
+	ic := header.ICMPv4(out[ihl:])
+	ic.SetType(header.ICMPv4EchoReply)
+	ic.SetCode(0)
+	ic.SetChecksum(0)
+	ic.SetChecksum(ic.Checksum())
+
+	if debug {
+		dbg("ICMP echo 本地应答: %s -> %s len=%d", net.IP(out[12:16]), net.IP(out[16:20]), len(out))
+	}
+	select {
+	case st.out <- out:
+		return true
+	case <-st.ctx.Done():
+		return true
+	}
 }
 
 // Outbound 返回栈要发给客户端的 IP 包。

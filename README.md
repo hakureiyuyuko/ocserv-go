@@ -174,6 +174,7 @@ docker run -d --name ocserv-go -p 443:443 -p 443:443/udp \
 | `-style` | `asa` | 登录风格：`asa`（模拟 Cisco ASA）或 `ocserv`（标准 XML） |
 | `-dtls` | true | 启用 DTLS 数据面 |
 | `-dtls-port` | 同 `-addr` | DTLS 端口 |
+| `-icmp-echo` | true | 客户端 ping 由服务端本地应答（echo reply，延迟 = 客户端到网关 RTT）；`false` 则不代答 |
 | `-http` | false | 明文 HTTP 预览模式（仅看页面） |
 | `-v` | false | 详细日志 |
 | `-version` | — | 显示版本 |
@@ -238,6 +239,27 @@ X-DTLS12-CipherSuite: ECDHE-RSA-AES256-GCM-SHA384
 
 > **需要 RSA 证书**（Cisco 用 ECDHE-RSA 套件）。ECDSA 证书时自动禁用 DTLS 并打日志；
 > 面板在 `backend=go` 时会用 RSA（ACME 2048 / 自签 rsa:2048）。
+
+## ICMP 应答（ping 延迟）
+
+有些应用（游戏、测速、连通性探针）会先 ping 一个外部地址来判断链路质量。隧道内的
+ping 如果被丢掉、或者绕到真实目的地，测出来的数字要么超时、要么包含整段公网 RTT。
+
+`-icmp-echo`（默认开启）让服务端**本地代答**：客户端发出的 ICMP echo request
+（目标地址任意，含外部地址）直接由服务端生成 echo reply，源地址就是被 ping 的地址，
+原样回显 identifier / sequence / 负载。
+
+效果：
+
+- ping 任何地址都有应答，不依赖目标主机是否响应；
+- 测到的延迟就是**客户端 ↔ 网关**的真实 RTT（不含公网绕行），正好是这类应用
+  “到网关延迟”的口径；
+- 除链路本身丢包外，丢包率为 0。
+
+关闭：`-icmp-echo=false`，此时 echo request 按普通数据包处理（送进网络栈，
+通常因无法路由而被丢弃）。
+
+---
 
 ## CSTP 头格式（TCP）
 
@@ -357,6 +379,7 @@ ocserv-go/
 
 ## 路线图
 
+- [ ] 面板里给 `-icmp-echo` 加开关（目前是命令行参数）
 - [ ] IPv6 隧道
 - [ ] CSTP 压缩
 - [ ] split 路由（按用户/组）
