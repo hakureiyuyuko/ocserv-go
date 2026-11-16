@@ -61,7 +61,16 @@ const DEFAULTS = {
   acmeBin: '/root/.acme.sh/acme.sh',
   acmeServer: 'https://acme-v02.api.letsencrypt.org/directory',
   renewScript: '/usr/local/bin/acme-renew.sh',
-  renewLog: '/var/log/acme-renew.log'
+  renewLog: '/var/log/acme-renew.log',
+  // 后端：ocserv = 系统 C 版（需要 tun/NET_ADMIN）；go = 本仓库 ocserv-go（用户态网络栈，无需特权）
+  backend: 'ocserv',
+  goBin: '/usr/local/bin/ocserv-go',
+  goUnit: 'ocserv-go',
+  goDNS: '1.1.1.1',
+  goMTU: 1400,
+  goDTLS: true,
+  goPort: 443,
+  goNet: ''
 };
 
 const SESSION_TTL = 12 * 3600 * 1000;
@@ -106,6 +115,8 @@ function loadConfig() {
 
   for (const k of Object.keys(DEFAULTS)) if (cfg[k] === undefined) cfg[k] = DEFAULTS[k];
   if (!cfg.sessionSecret) cfg.sessionSecret = crypto.randomBytes(32).toString('hex');
+  // Go 后端用独立 systemd 单元
+  cfg.ocservService = cfg.backend === 'go' ? (cfg.goUnit || 'ocserv-go') : (cfg.ocservService || 'ocserv');
 
   let initPw = null;
   if (!cfg.users || !Object.keys(cfg.users).length) {
@@ -201,6 +212,17 @@ setInterval(() => {
 
 async function ocservStatus() {
   const p = await SVC.show(CFG.ocservService);
+
+  if (CFG.backend === 'go') {
+    const v = await run(CFG.goBin, ['-version']);
+    const version = 'ocserv-go ' + ((v.out || '').trim() || '?');
+    const listen = [];
+    if (CFG.goPort) {
+      listen.push({ proto: 'TCP', port: Number(CFG.goPort) });
+      if (CFG.goDTLS !== false) listen.push({ proto: 'UDP', port: Number(CFG.goPort) });
+    }
+    return { ...p, active: await systemctlActive(), version, listen };
+  }
 
   const verRaw = await run(CFG.ocservBin, ['--version']);           // 注意: 版本信息走 stderr
   const version = ((verRaw.out || '') + (verRaw.err || '')).split('\n').map((s) => s.trim()).filter(Boolean)[0] || '';
@@ -488,8 +510,9 @@ async function setupStatus() {
     initialized: hasConf && cert.exists,
     hasConf, certExists: cert.exists, cert,
     service: { active: st.active, sub: st.SubState, enabled: en.trim(), version: st.version },
-    hasNAT: !!fileInfo(natUnitFile()),
-    natActive: (await SVC.active('ocserv-nat')).trim(),
+    backend: CFG.backend || 'ocserv',
+    hasNAT: CFG.backend === 'go' ? false : !!fileInfo(natUnitFile()),
+    natActive: CFG.backend === 'go' ? '' : (await SVC.active('ocserv-nat')).trim(),
     acmeInstalled: !!fileInfo(CFG.acmeBin) || !!fileInfo('/usr/bin/acme.sh'),
     panel: { port: CFG.port, host: CFG.host, service: PANEL_SVC },
     outIf: await detectOutIf(),
@@ -613,7 +636,8 @@ async function runIssue(L, opt, env) {
   const args = ['--issue', '--server', CFG.acmeServer];
   if (opt.mode === 'dns') args.push('--dns', 'dns_' + opt.provider, '--dnssleep', String(opt.dnssleep || 30));
   else args.push('--standalone');
-  args.push('-d', domain, '--keylength', 'ec-256');
+  // Go 后端的 Cisco 风格 DTLS 需要 RSA 证书；C 版 ocserv 用 ec-256 更省资源
+  args.push('-d', domain, '--keylength', (CFG.backend === 'go' ? '2048' : 'ec-256'));
   L('签发: acme.sh ' + args.join(' '));
   const r1 = await acmeRun(args, env, 300000);
   if (r1.code === 2) L('  证书仍有效，跳过签发 (acme.sh RENEW_SKIP=2)');
@@ -681,7 +705,10 @@ async function doCert(p, L) {
 
   if (mode === 'selfsigned') {
     try { fs.mkdirSync(certDir, { recursive: true }); } catch (e) {}
-    const r = await run('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1',
+    const keyArgs = CFG.backend === 'go'
+      ? ['-newkey', 'rsa:2048']                       // Go 后端 DTLS 需要 RSA
+      : ['-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1'];
+    const r = await run('openssl', ['req', '-x509', ...keyArgs,
       '-nodes', '-days', '30', '-subj', '/CN=' + domain, '-addext', 'subjectAltName=DNS:' + domain,
       '-keyout', certDir + '/privkey.pem', '-out', certDir + '/fullchain.pem'], null, 60000);
     if (r.code !== 0) { L('x 生成自签证书失败:\n' + tailOf(r)); return false; }
@@ -741,6 +768,85 @@ async function doCert(p, L) {
   return true;
 }
 
+// ip4 工具：网段地址 + 1 作为隧道内服务端地址
+function ip4Int(str) {
+  const p = String(str || '').split('.').map((x) => parseInt(x, 10) || 0);
+  return ((p[0] << 24) >>> 0) + (p[1] << 16) + (p[2] << 8) + p[3];
+}
+function int4Ip(n) {
+  n = n >>> 0;
+  return [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.');
+}
+
+// applyGo 生成 /etc/systemd/system/ocserv-go.service 并启动
+async function applyGo(L, o) {
+  const bin = CFG.goBin || '/usr/local/bin/ocserv-go';
+  if (!fileInfo(bin)) { L('x 找不到 Go 后端二进制: ' + bin + '（先安装 ocserv-go）'); return false; }
+
+  const bits = maskBits(o.vpnMask);
+  const net = o.vpnNet + '/' + bits;
+  const serverIP = int4Ip(ip4Int(o.vpnNet) + 1);
+  const dns = [o.dns1, o.dns2].filter(Boolean).join(',');
+
+  const args = [
+    bin,
+    '-addr', ':' + o.vpnPort,
+    '-users', CFG.ocpasswd,
+    '-cert', CFG.certFile,
+    '-key', CFG.keyFile,
+    '-net', net,
+    '-ip', serverIP,
+    '-dns', dns,
+    '-mtu', String(CFG.goMTU || 1400),
+    '-domain', o.domain
+  ];
+  if (CFG.goDTLS === false) args.push('-dtls=false');
+
+  const unit = [
+    '[Unit]',
+    'Description=ocserv-go (userspace AnyConnect VPN)',
+    'After=network-online.target',
+    'Wants=network-online.target',
+    '',
+    '[Service]',
+    'Type=simple',
+    'ExecStart=' + args.join(' '),
+    'Restart=always',
+    'RestartSec=3',
+    '',
+    '[Install]',
+    'WantedBy=multi-user.target',
+    ''
+  ].join('\n');
+
+  writeAs('/etc/systemd/system/ocserv-go.service', unit, 0o644);
+  L('v 已写入 /etc/systemd/system/ocserv-go.service');
+  if (!fileInfo(CFG.ocpasswd)) writeAs(CFG.ocpasswd, '', 0o600);
+
+  CFG.goPort = Number(o.vpnPort);
+  CFG.goNet = net;
+  saveConfig(CFG);
+
+  await SVC.daemonReload();
+  await SVC.enable(CFG.ocservService);
+  await SVC.action('restart', CFG.ocservService);
+
+  let st = await ocservStatus();
+  for (let i = 0; i < 10 && st.active !== 'active'; i++) {
+    await new Promise((r) => setTimeout(r, 600));
+    st = await ocservStatus();
+  }
+  L('  Go 后端在进程内出网：不需要 tun / iptables / NET_ADMIN，也不需要 NAT 单元');
+  L((st.active === 'active' ? 'v' : 'x') + ' ocserv-go 服务: ' + st.active + '/' + (st.SubState || '-'));
+  L('v 监听: ' + (st.listen || []).map((x) => x.proto + ' ' + x.port).join(' · ') + '  客户端网段 ' + net + '  隧道地址 ' + serverIP);
+  if (st.active !== 'active') {
+    const tail = ((await SVC.logs(CFG.ocservService, 12)) || '').trim();
+    if (tail) L('  最近的日志:\n' + tail);
+    L('  排查: ' + SVC.logsHint(CFG.ocservService));
+  }
+  return st.active === 'active';
+}
+
 async function doApply(p, L) {
   const domain = String(p.domain || CFG.acmeDomain || '').trim().toLowerCase();
   const vpnPort = String(parseInt(p.vpnPort, 10) || 443);
@@ -756,6 +862,11 @@ async function doApply(p, L) {
   if (!/^\d+$/.test(vpnPort) || +vpnPort < 1 || +vpnPort > 65535) { L('x 端口不合法'); return false; }
   if (!/^[A-Za-z0-9._:-]+$/.test(outIf)) { L('x 出口网卡名不合法'); return false; }
   if (!fileInfo('/etc/ssl/securev/' + domain + '/fullchain.pem')) { L('x 没找到 ' + domain + ' 的证书，请先完成「第 2 步 证书」'); return false; }
+
+  // Go 后端：不写 ocserv.conf，改成生成 systemd 单元（用户态网络栈，不需要 NAT）
+  if (CFG.backend === 'go') {
+    return applyGo(L, { domain, vpnPort, vpnNet, vpnMask, dns1, dns2 });
+  }
 
   const t = tpl('ocserv.conf.tpl');
   if (!t) { L('x 找不到模板 ' + path.join(TPL_DIR, 'ocserv.conf.tpl')); return false; }

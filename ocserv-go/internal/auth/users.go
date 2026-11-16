@@ -14,6 +14,9 @@ import (
 	"os"
 	"strings"
 
+	"github.com/GehirnInc/crypt"
+	_ "github.com/GehirnInc/crypt/sha256_crypt"
+	_ "github.com/GehirnInc/crypt/sha512_crypt"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -39,14 +42,24 @@ func Load(path string) (*Users, error) {
 		if s == "" || strings.HasPrefix(s, "#") {
 			continue
 		}
-		i := strings.IndexByte(s, ':')
-		if i <= 0 {
-			return nil, fmt.Errorf("%s:%d: 需要 用户名:哈希 格式", path, line)
+		// 支持两种格式：
+		//   user:哈希                  （ocserv-go 自己的格式）
+		//   user:group:哈希            （ocserv/ocpasswd 的格式，面板在用的就是它）
+		parts := strings.Split(s, ":")
+		var name, hash string
+		switch len(parts) {
+		case 2:
+			name, hash = parts[0], strings.TrimSpace(parts[1])
+		case 3:
+			name, hash = parts[0], strings.TrimSpace(parts[2])
+		default:
+			return nil, fmt.Errorf("%s:%d: 需要 用户名:哈希 或 用户名:组:哈希", path, line)
 		}
-		name := s[:i]
-		hash := strings.TrimSpace(s[i+1:])
-		if !strings.HasPrefix(hash, "$2") {
-			return nil, fmt.Errorf("%s:%d: %q 不是 bcrypt 哈希（用 `ocserv-go hash` 生成）", path, line, name)
+		if name == "" {
+			return nil, fmt.Errorf("%s:%d: 用户名为空", path, line)
+		}
+		if !isSupportedHash(hash) {
+			return nil, fmt.Errorf("%s:%d: %q 的密码哈希不受支持（支持 bcrypt $2x$ 与 crypt $5$/$6$/$1$）", path, line, name)
 		}
 		u.m[name] = hash
 	}
@@ -64,10 +77,31 @@ func (u *Users) Verify(name, pass string) bool {
 	hash, ok := u.m[name]
 	if !ok {
 		// 固定的假哈希，保证耗时接近
-		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$C6UzMDM.H6dfI/f/IKcEeO5r1o9Q3g5n8x7y6z5w4v3u2t1s0r9p8"), []byte(pass))
+		_ = verifyHash("$2a$10$C6UzMDM.H6dfI/f/IKcEeO5r1o9Q3g5n8x7y6z5w4v3u2t1s0r9p8", pass)
 		return false
 	}
-	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(pass)) == nil
+	return verifyHash(hash, pass)
+}
+
+// isSupportedHash 判断哈希格式：bcrypt 或 crypt(3)（ocpasswd 默认是 $5$/$6$）。
+func isSupportedHash(h string) bool {
+	for _, p := range []string{"$2a$", "$2b$", "$2y$", "$5$", "$6$", "$1$"} {
+		if strings.HasPrefix(h, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func verifyHash(hash, pass string) bool {
+	if strings.HasPrefix(hash, "$2") {
+		return bcrypt.CompareHashAndPassword([]byte(hash), []byte(pass)) == nil
+	}
+	c := crypt.NewFromHash(hash)
+	if c == nil {
+		return false
+	}
+	return c.Verify(hash, []byte(pass)) == nil
 }
 
 // Has 判断用户是否存在。

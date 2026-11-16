@@ -247,6 +247,34 @@ sed -i -e 's/@DOMAIN@/你的域名/' -e 's/@OCSERV_SERVICE@/ocserv/' -e 's/@PANE
    写证书前先 `mkdir -p /etc/ssl/securev/<域名>`；另外它返回非 0 不一定是失败
    （证书已写好、只是 reloadcmd 失败时也会返回非 0），判据应该是文件写没写。
 
+## 运行后端（ocserv / ocserv-go）
+
+面板支持两种后端，在 `config.json` 里切换（默认 `ocserv`）：
+
+```json
+{
+  "backend": "go",
+  "goBin": "/usr/local/bin/ocserv-go",
+  "goUnit": "ocserv-go",
+  "goMTU": 1400,
+  "goDTLS": true
+}
+```
+
+| | `ocserv`（默认） | `go` |
+|---|---|---|
+| 程序 | `/usr/sbin/ocserv` | `ocserv-go` |
+| 配置 | `/etc/ocserv/ocserv.conf` | 不写 conf，生成 `/etc/systemd/system/ocserv-go.service` |
+| 网络 | 需要 tun + NAT 单元 | **进程内出网**，不装 NAT、不需要 tun/特权 |
+| 用户库 | `/etc/ocserv/ocpasswd` | 同一个文件（ocserv-go 兼容 ocpasswd 格式） |
+| 证书 | 同一套 | 同一套（`certFile` / `keyFile`） |
+| 状态/日志 | systemd | systemd（服务名取 `goUnit`） |
+
+切到 `go` 后，向导第 4 步会生成单元并启动；「用户管理」照常写 ocpasswd，
+Go 后端直接读它。**证书流程完全不变**。
+
+> Go 后端的 DTLS 需要 **RSA 证书**（Cisco 用 ECDHE-RSA 套件）。
+
 ## 更新日志
 
 - **1.6.7** —— 状态页的 NAT 单元路径按服务管理器取（OpenRC 用 `/etc/init.d/ocserv-nat`）并显示

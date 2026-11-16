@@ -38,6 +38,8 @@ import (
 	"github.com/hakureiyuyuko/ocserv-deploy-kit/ocserv-go/internal/usrnet"
 )
 
+const version = "0.1.0"
+
 var (
 	addr       = flag.String("addr", ":443", "监听地址")
 	certFile   = flag.String("cert", "", "TLS 证书（PEM）")
@@ -55,6 +57,7 @@ var (
 	httpOnly   = flag.Bool("http", false, "仅用于预览 Web 页面：用明文 HTTP 启动（真实客户端必须用 TLS）")
 	dtlsOn     = flag.Bool("dtls", true, "启用 DTLS（UDP 数据面，与 TCP 同端口）")
 	dtlsPort   = flag.Int("dtls-port", 0, "DTLS 端口（默认与 -addr 相同）")
+	showVer    = flag.Bool("version", false, "显示版本后退出")
 	verbose    = flag.Bool("v", false, "详细日志")
 )
 
@@ -167,6 +170,10 @@ func newServer(c serverConfig) (*server, error) {
 func main() {
 	flag.Usage = usage
 	flag.Parse()
+	if *showVer {
+		fmt.Println(version)
+		return
+	}
 
 	// 子命令：哈希
 	if flag.Arg(0) == "hash" {

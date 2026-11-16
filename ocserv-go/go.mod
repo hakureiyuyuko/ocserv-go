@@ -9,6 +9,7 @@ require (
 )
 
 require (
+	github.com/GehirnInc/crypt v0.0.0-20230320061759-8cc1b52080c5 // indirect
 	github.com/google/btree v1.1.2 // indirect
 	github.com/pion/dtls/v3 v3.1.15 // indirect
 	github.com/pion/logging v0.2.4 // indirect

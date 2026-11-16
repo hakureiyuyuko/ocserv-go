@@ -46,11 +46,14 @@ docker run -d --name ocserv-go -p 443:443 \
 
 - **已完成**：AnyConnect 认证握手（**两种风格**：默认 `asa` 复刻 Cisco ASA 的 `/+webvpn+/index.html`
   表单流程，`ocserv` 走标准 XML；含 `error id=15`、`webvpn` cookie；不做组选择）、
-  `CONNECT /CSTP` + CSTP 帧、gVisor 栈内的 TCP/UDP 代理、客户端地址池、DPD 保活、
-  可选 SOCKS5 出网出口、`-self-signed` 联调
+  `CONNECT /CSTP` + CSTP 帧、**Cisco 风格 DTLS**（UDP 数据面）、gVisor 栈内的 TCP/UDP 代理、
+  客户端地址池、DPD 保活、可选 SOCKS5 出网出口、`-self-signed` 联调
 - **已验证**：`go test ./...`（含 `TestTunnelTCP` 完整链路：认证 → 隧道 → 访问宿主 HTTP 服务）、
   手工 UDP 端到端、以 `nobody` 用户启动并正常响应
-- **未做**：DTLS（下一步）、内置 Let's Encrypt、IPv6、压缩、分流量路由、与面板集成、CI
+- **面板适配**：面板新增「运行后端」`backend=go`，向导第 4 步生成 `ocserv-go.service`
+  并启动；用户仍用 `/etc/ocserv/ocpasswd`（Go 端兼容 `$5$/$6$` crypt 与 bcrypt），证书流程不变，
+  NAT 单元自动跳过（用户态出网）
+- **未做**：内置 Let's Encrypt、IPv6、压缩、分流量路由、CI
 
 ---
 
