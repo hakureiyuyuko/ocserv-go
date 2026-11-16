@@ -37,7 +37,7 @@ require_supported_os() {
   if command -v apk >/dev/null 2>&1; then
     echo "错误：Alpine（apk）暂不支持：本面板用 systemd 单元托管、用 systemctl 做服务控制，" >&2
     echo "      Alpine 没有 systemd。请用 release 里的 Alpine 一键包（自带二进制与 OpenRC 单元），" >&2
-    echo "      或仓库 docker/ 下的容器镜像。" >&2
+    echo "      或参考 ocserv-go/ 下的 Dockerfile 自建镜像。" >&2
     exit 1
   fi
   echo "错误：未检测到 apt-get + systemctl，本安装脚本只支持 Debian / Ubuntu。" >&2

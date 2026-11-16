@@ -4,8 +4,16 @@
 数据面换成 **gVisor 用户态 TCP/IP 栈** —— 所以**不需要 `/dev/net/tun`、不需要 `NET_ADMIN`、
 不需要 `iptables` / `ip_forward`**，无特权 LXC / Docker / PaaS 里都能跑。
 
-> 当前版本 **1.0.0**（`ocserv-go` 分支）。生产部署仍建议用
-> [`main`](https://github.com/hakureiyuyuko/ocserv-deploy-kit) 分支的 C 版 ocserv。
+> 当前版本 **1.0.0**。本仓库只包含 Go 版服务端与管理面板；
+> C 版 ocserv 部署套件在另一个仓库：[ocserv-deploy-kit](https://github.com/hakureiyuyuko/ocserv-deploy-kit)。
+
+## 仓库结构
+
+```
+ocserv-go/       # Go 服务端源码（main.go、internal/、install.sh、Dockerfile）
+ocserv-panel/    # 管理面板（Node，backend=go）
+.github/         # CI：推 v* tag 自动出双架构包并发布 Release
+```
 
 ---
 
