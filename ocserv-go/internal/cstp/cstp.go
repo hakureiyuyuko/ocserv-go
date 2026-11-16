@@ -73,22 +73,22 @@ var ErrTooLarge = errors.New("cstp: 帧过大")
 const MaxPayload = 64 * 1024
 
 // WriteFrame 写一个 TCP CSTP 帧。
+//
+// 必须「帧头 + 负载」一次写出：分两次 Write 时 Go 的 TLS 会拆成两个 TLS 记录，
+// 客户端（openconnect / 真 AnyConnect）单次读到的记录只有 8 字节帧头，
+// 会报 "Unexpected packet length ... SSL_read returned 8" 并丢包错位，
+// 表现为隧道刚建立就断开重连。
 func WriteFrame(w io.Writer, typ Type, payload []byte) error {
 	if len(payload) > MaxPayload {
 		return ErrTooLarge
 	}
-	var h [HeaderLen]byte
-	h[0], h[1], h[2], h[3] = magic0, magic1, magic2, versionByte
-	binary.BigEndian.PutUint16(h[4:6], uint16(len(payload)))
-	h[6] = byte(typ)
-	h[7] = 0
-	if _, err := w.Write(h[:]); err != nil {
-		return err
-	}
-	if len(payload) == 0 {
-		return nil
-	}
-	_, err := w.Write(payload)
+	buf := make([]byte, HeaderLen+len(payload))
+	buf[0], buf[1], buf[2], buf[3] = magic0, magic1, magic2, versionByte
+	binary.BigEndian.PutUint16(buf[4:6], uint16(len(payload)))
+	buf[6] = byte(typ)
+	buf[7] = 0
+	copy(buf[HeaderLen:], payload)
+	_, err := w.Write(buf)
 	return err
 }
 

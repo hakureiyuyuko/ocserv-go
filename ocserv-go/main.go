@@ -496,7 +496,22 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 
 // serveASAStatic 复刻真机会被扫描器探测的静态资源路径（内容是自绘的占位）。
 func (s *server) serveASAStatic(w http.ResponseWriter, r *http.Request, p string) bool {
+	// 真 ocserv 对这些路径回 200 + 一个小 XML（worker-http-handlers.c get_string_handler），
+	// 回 404 会让真 AnyConnect 客户端在隧道建立后立刻重连。
+	xmlVpn := "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<vpn rev=\"1.0\">\n</vpn>\n"
 	switch p {
+	case "/+CSCOT+/translation-table", "/+CSCOT+/oem-customization", "/VPNManifest.xml", "/1/VPNManifest.xml":
+		w.Header().Set("Content-Type", "text/xml")
+		_, _ = w.Write([]byte(xmlVpn))
+		return true
+	case "/1/binaries/update.txt":
+		w.Header().Set("Content-Type", "text/xml")
+		_, _ = w.Write([]byte("0,0,0000\n"))
+		return true
+	case "/1/index.html", "/1/Linux", "/1/Linux_64", "/1/Windows", "/1/Windows_ARM64", "/1/Darwin_i386":
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte("<html></html>\n"))
+		return true
 	case "/+CSCOE+/logon_custom.css":
 		w.Header().Set("Content-Type", "text/css; charset=utf-8")
 		_, _ = w.Write(asa.LogonCSS())
@@ -868,6 +883,14 @@ func (s *server) pendUser(tok string) string {
 
 func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	sess := sessionOf(r.Context())
+	var hs []string
+	for k, v := range r.Header {
+		lk := strings.ToLower(k)
+		if strings.HasPrefix(lk, "x-cstp") || strings.HasPrefix(lk, "x-dtls") || lk == "cookie" || lk == "user-agent" || lk == "host" {
+			hs = append(hs, k+"="+strings.Join(v, ","))
+		}
+	}
+	log.Printf("CONNECT %s 请求头: %s", r.URL.Path, strings.Join(hs, " | "))
 	if sess == nil {
 		http.Error(w, "no session", http.StatusBadRequest)
 		return
@@ -941,6 +964,20 @@ func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// MTU 协商与真 ocserv 一致：link_mtu = min(1500, 客户端 Base-Mtu)，
+	// 数据 MTU = link - 28（无 DTLS 时）。客户端自报 1460 而我们回 1500 时，
+	// 真 AnyConnect 会认为配置不自洽并立刻重连。
+	linkMTU := 1500
+	if v := r.Header.Get("X-Cstp-Base-Mtu"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 800 && n < linkMTU {
+			linkMTU = n
+		}
+	}
+	dataMTU := s.mtu
+	if maxData := linkMTU - 28; dataMTU > maxData {
+		dataMTU = maxData
+	}
+
 	// 建隧道：直接回裸 HTTP 响应，之后是 CSTP 二进制流。
 	// 字段与取值逐项照「能用的」那台 ocserv（dpd=90 / keepalive=32400 /
 	// rekey-time=172800+ssl / mtu=1420 / 无 session-timeout 即 none）：
@@ -975,11 +1012,11 @@ func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(conn, "X-DTLS-Port: %d\r\n", s.dtlsPort)
 		fmt.Fprintf(conn, "X-DTLS-12: 1\r\n")
 		fmt.Fprintf(conn, "X-DTLS-DPD: 90\r\n")
-		fmt.Fprintf(conn, "X-DTLS-MTU: %d\r\n", s.mtu)
+		fmt.Fprintf(conn, "X-DTLS-MTU: %d\r\n", dataMTU)
 		fmt.Fprintf(conn, "X-DTLS12-CipherSuite: %s\r\n", dtlsx.SuiteNameRSA)
 	}
-	fmt.Fprintf(conn, "X-CSTP-Base-MTU: 1500\r\n")
-	fmt.Fprintf(conn, "X-CSTP-MTU: %d\r\n", s.mtu)
+	fmt.Fprintf(conn, "X-CSTP-Base-MTU: %d\r\n", linkMTU)
+	fmt.Fprintf(conn, "X-CSTP-MTU: %d\r\n", dataMTU)
 	fmt.Fprintf(conn, "\r\n")
 
 	log.Printf("隧道建立: 用户=%s 客户端 IP=%s", user, ip)
@@ -1151,6 +1188,9 @@ func (s *server) tunnel(ctx context.Context, conn net.Conn, br *bufio.Reader, us
 				}
 				dtlsMu.Unlock()
 			}
+			if *verbose {
+				log.Printf("CSTP 发送: 类型=%s(%d) 长度=%d viaDTLS=%v", f.typ, int(f.typ), len(f.payload), target != conn)
+			}
 			var werr error
 			if target != conn {
 				if *verbose {
@@ -1213,6 +1253,9 @@ func (s *server) tunnel(ctx context.Context, conn net.Conn, br *bufio.Reader, us
 	for {
 		select {
 		case f := <-in:
+			if *verbose {
+				log.Printf("CSTP 收到: 类型=%s(%d) 长度=%d viaDTLS=%v", f.typ, int(f.typ), len(f.payload), f.viaDTLS)
+			}
 			switch f.typ {
 			case cstp.TypeData:
 				if err := st.Inject(f.payload); err != nil && *verbose {

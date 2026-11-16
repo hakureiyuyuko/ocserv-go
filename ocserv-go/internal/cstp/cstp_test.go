@@ -48,3 +48,30 @@ func TestTooLarge(t *testing.T) {
 		t.Fatal("超过上限时不应写出任何内容")
 	}
 }
+
+// 帧头与负载必须一次写出（否则会被拆成两个 TLS 记录，客户端解析失败）。
+func TestWriteFrameSingleWrite(t *testing.T) {
+	var w oneWrite
+	payload := []byte{0x45, 0x00, 0x00, 0x28}
+	if err := WriteFrame(&w, TypeData, payload); err != nil {
+		t.Fatal(err)
+	}
+	if w.writes != 1 {
+		t.Fatalf("应一次写出，实际 %d 次", w.writes)
+	}
+	want := []byte{'S', 'T', 'F', 1, 0x00, 0x04, 0x00, 0x00, 0x45, 0x00, 0x00, 0x28}
+	if string(w.buf) != string(want) {
+		t.Fatalf("字节不符: got % x want % x", w.buf, want)
+	}
+}
+
+type oneWrite struct {
+	buf    []byte
+	writes int
+}
+
+func (o *oneWrite) Write(p []byte) (int, error) {
+	o.writes++
+	o.buf = append(o.buf, p...)
+	return len(p), nil
+}
