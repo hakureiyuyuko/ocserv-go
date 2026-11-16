@@ -4,7 +4,7 @@
 数据面换成 **gVisor 用户态 TCP/IP 栈** —— 所以**不需要 `/dev/net/tun`、不需要 `NET_ADMIN`、
 不需要 `iptables` / `ip_forward`**，无特权 LXC / Docker / PaaS 里都能跑。
 
-> 当前版本 **1.1.0**。本仓库只包含 Go 版服务端与管理面板；
+> 当前版本 **1.1.1**。本仓库只包含 Go 版服务端与管理面板；
 > C 版 ocserv 部署套件在另一个仓库：[ocserv-deploy-kit](https://github.com/hakureiyuyuko/ocserv-deploy-kit)。
 
 ## 仓库结构
@@ -66,13 +66,13 @@ ocserv-go
 从 [Releases](https://github.com/hakureiyuyuko/ocserv-deploy-kit/releases) 下载对应架构：
 
 ```
-ocserv-go-1.1.0-linux-amd64.tar.gz     # x86_64
-ocserv-go-1.1.0-linux-arm64.tar.gz     # aarch64
+ocserv-go-1.1.1-linux-amd64.tar.gz     # x86_64
+ocserv-go-1.1.1-linux-arm64.tar.gz     # aarch64
 ```
 
 ```bash
-tar xzf ocserv-go-1.1.0-linux-amd64.tar.gz
-cd ocserv-go-1.1.0-linux-amd64
+tar xzf ocserv-go-1.1.1-linux-amd64.tar.gz
+cd ocserv-go-1.1.1-linux-amd64
 sudo ./install.sh --domain vpn.example.com --user alice
 ```
 

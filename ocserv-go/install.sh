@@ -23,7 +23,7 @@
 # ============================================================================
 set -eu
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 SRC=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 DOMAIN="vpn.example.com"
