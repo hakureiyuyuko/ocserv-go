@@ -36,6 +36,7 @@ import (
 	"github.com/hakureiyuyuko/ocserv-go/internal/asa"
 	"github.com/hakureiyuyuko/ocserv-go/internal/assets"
 	"github.com/hakureiyuyuko/ocserv-go/internal/auth"
+	"github.com/hakureiyuyuko/ocserv-go/internal/connlog"
 	"github.com/hakureiyuyuko/ocserv-go/internal/cstp"
 	"github.com/hakureiyuyuko/ocserv-go/internal/dtlsx"
 	"github.com/hakureiyuyuko/ocserv-go/internal/ippool"
@@ -45,36 +46,37 @@ import (
 const version = "1.1.0"
 
 var (
-	addr       = flag.String("addr", ":443", "监听地址")
-	certFile   = flag.String("cert", "", "TLS 证书（PEM）")
-	keyFile    = flag.String("key", "", "TLS 私钥（PEM）")
-	usersFile  = flag.String("users", "", "用户文件（每行 用户名:bcrypt 哈希）")
-	serverIP   = flag.String("ip", "10.66.66.1", "隧道内服务端地址")
-	clientNet  = flag.String("net", "10.66.66.0/24", "客户端地址池网段")
-	dnsStr     = flag.String("dns", "1.1.1.1", "下发给客户端的 DNS（逗号分隔，最多 2 个）")
-	mtu        = flag.Int("mtu", 1400, "隧道 MTU")
-	dpd        = flag.Int("dpd", 30, "保活间隔（秒）")
-	socksAddr  = flag.String("socks", "", "出网走 SOCKS5（host:port，可选；UDP 仍直连）")
-	selfSigned = flag.Bool("self-signed", false, "没有证书时自动生成自签证书（联调用）")
-	domain     = flag.String("domain", "ocserv-go.local", "自签证书/默认域使用的域名")
-	style      = flag.String("style", "asa", "登录协议风格: asa（模拟 Cisco ASA）或 ocserv")
-	httpOnly   = flag.Bool("http", false, "仅用于预览 Web 页面：用明文 HTTP 启动（真实客户端必须用 TLS）")
-	dtlsOn     = flag.Bool("dtls", true, "启用 DTLS（UDP 数据面，与 TCP 同端口）")
-	dtlsPort   = flag.Int("dtls-port", 0, "DTLS 端口（默认与 -addr 相同）")
-	showVer    = flag.Bool("version", false, "显示版本后退出")
-	assetsDir  = flag.String("assets", "/etc/ocserv-go/assets", "用户上传的 Cisco 登录页资源目录（图片/CSS/logon.html）")
-	acmeAuto   = flag.Bool("acme-auto", true, "按 -acme-state 自动续期证书（面板签发时写入该文件）")
-	acmeState  = flag.String("acme-state", "/etc/ocserv-go/acme.json", "自动续期配置（域名/服务商/邮箱/凭据路径）")
-	icmpEcho   = flag.Bool("icmp-echo", true, "本地应答客户端的 ICMP ping（返回客户端到网关的延迟；false 则透传/丢弃）")
-	acmeOnce   = flag.Bool("acme-once", false, "申请/续期证书后退出（DNS-01，内置 lego）")
-	acmeDomain = flag.String("acme-domain", "", "ACME 域名（-acme-once 时必填）")
-	acmeEmail  = flag.String("acme-email", "", "ACME 账号邮箱（可空）")
-	acmeDNS    = flag.String("acme-dns", "", "DNS 服务商: cloudflare / alidns / tencentcloud / dnspod")
-	acmeCache  = flag.String("acme-cache", "/etc/ocserv-go/acme", "ACME 账号与缓存目录")
-	acmeEnv    = flag.String("acme-env", "/etc/ocserv-go/acme.env", "凭据环境变量文件（KEY=VALUE）")
-	acmeStage  = flag.Bool("acme-staging", false, "用 Let's Encrypt staging 环境")
-	acmeKeyTyp = flag.String("acme-key-type", "rsa2048", "证书密钥类型: rsa2048 / ec256")
-	verbose    = flag.Bool("v", false, "详细日志")
+	addr        = flag.String("addr", ":443", "监听地址")
+	certFile    = flag.String("cert", "", "TLS 证书（PEM）")
+	keyFile     = flag.String("key", "", "TLS 私钥（PEM）")
+	usersFile   = flag.String("users", "", "用户文件（每行 用户名:bcrypt 哈希）")
+	serverIP    = flag.String("ip", "10.66.66.1", "隧道内服务端地址")
+	clientNet   = flag.String("net", "10.66.66.0/24", "客户端地址池网段")
+	dnsStr      = flag.String("dns", "1.1.1.1", "下发给客户端的 DNS（逗号分隔，最多 2 个）")
+	mtu         = flag.Int("mtu", 1400, "隧道 MTU")
+	dpd         = flag.Int("dpd", 30, "保活间隔（秒）")
+	socksAddr   = flag.String("socks", "", "出网走 SOCKS5（host:port，可选；UDP 仍直连）")
+	selfSigned  = flag.Bool("self-signed", false, "没有证书时自动生成自签证书（联调用）")
+	domain      = flag.String("domain", "ocserv-go.local", "自签证书/默认域使用的域名")
+	style       = flag.String("style", "asa", "登录协议风格: asa（模拟 Cisco ASA）或 ocserv")
+	httpOnly    = flag.Bool("http", false, "仅用于预览 Web 页面：用明文 HTTP 启动（真实客户端必须用 TLS）")
+	dtlsOn      = flag.Bool("dtls", true, "启用 DTLS（UDP 数据面，与 TCP 同端口）")
+	dtlsPort    = flag.Int("dtls-port", 0, "DTLS 端口（默认与 -addr 相同）")
+	showVer     = flag.Bool("version", false, "显示版本后退出")
+	assetsDir   = flag.String("assets", "/etc/ocserv-go/assets", "用户上传的 Cisco 登录页资源目录（图片/CSS/logon.html）")
+	connLogPath = flag.String("conn-log", "/etc/ocserv-go/connections.jsonl", "连接日志（JSONL，只记成功连接；空=不记录）")
+	acmeAuto    = flag.Bool("acme-auto", true, "按 -acme-state 自动续期证书（面板签发时写入该文件）")
+	acmeState   = flag.String("acme-state", "/etc/ocserv-go/acme.json", "自动续期配置（域名/服务商/邮箱/凭据路径）")
+	icmpEcho    = flag.Bool("icmp-echo", true, "本地应答客户端的 ICMP ping（返回客户端到网关的延迟；false 则透传/丢弃）")
+	acmeOnce    = flag.Bool("acme-once", false, "申请/续期证书后退出（DNS-01，内置 lego）")
+	acmeDomain  = flag.String("acme-domain", "", "ACME 域名（-acme-once 时必填）")
+	acmeEmail   = flag.String("acme-email", "", "ACME 账号邮箱（可空）")
+	acmeDNS     = flag.String("acme-dns", "", "DNS 服务商: cloudflare / alidns / tencentcloud / dnspod")
+	acmeCache   = flag.String("acme-cache", "/etc/ocserv-go/acme", "ACME 账号与缓存目录")
+	acmeEnv     = flag.String("acme-env", "/etc/ocserv-go/acme.env", "凭据环境变量文件（KEY=VALUE）")
+	acmeStage   = flag.Bool("acme-staging", false, "用 Let's Encrypt staging 环境")
+	acmeKeyTyp  = flag.String("acme-key-type", "rsa2048", "证书密钥类型: rsa2048 / ec256")
+	verbose     = flag.Bool("v", false, "详细日志")
 )
 
 type ctxKey struct{}
@@ -100,6 +102,7 @@ func withSession(ctx context.Context, c net.Conn) context.Context {
 type server struct {
 	users     *auth.Users
 	certStore *certStore
+	connLog   *connlog.Log
 	assetsDir string
 	icmpEcho  bool
 	pendMu    sync.Mutex
@@ -146,6 +149,7 @@ type serverConfig struct {
 	DTLS      bool
 	DTLSPort  int
 	CertStore *certStore
+	ConnLog   *connlog.Log
 	AssetsDir string
 	ICMPEcho  bool
 	Dial      usrnet.DialFunc
@@ -169,6 +173,7 @@ func newServer(c serverConfig) (*server, error) {
 		dns:       c.DNS,
 		prefix:    ones,
 		certStore: c.CertStore,
+		connLog:   c.ConnLog,
 		assetsDir: c.AssetsDir,
 		icmpEcho:  c.ICMPEcho,
 		serverIP:  net.ParseIP(c.ServerIP),
@@ -258,6 +263,7 @@ func main() {
 		DTLS:      *dtlsOn && !*httpOnly,
 		DTLSPort:  *dtlsPort,
 		CertStore: store,
+		ConnLog:   connlog.Open(*connLogPath),
 		AssetsDir: *assetsDir,
 		ICMPEcho:  *icmpEcho,
 		Dial:      buildDialer(*socksAddr),
@@ -1047,6 +1053,13 @@ func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(conn, "\r\n")
 
 	log.Printf("隧道建立: 用户=%s 客户端 IP=%s", user, ip)
+	if s.connLog != nil {
+		peer := ""
+		if a, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+			peer = a.IP.String()
+		}
+		go s.connLog.Record(user, peer)
+	}
 	defer log.Printf("隧道断开: 用户=%s 客户端 IP=%s", user, ip)
 
 	s.tunnel(r.Context(), conn, brw.Reader, user, ip, tun)

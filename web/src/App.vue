@@ -8,6 +8,7 @@ import Settings from './views/Settings.vue'
 import Logs from './views/Logs.vue'
 import PanelSettings from './views/PanelSettings.vue'
 import Assets from './views/Assets.vue'
+import Connections from './views/Connections.vue'
 
 const user = ref('')
 const title = ref('ocserv-go 管理面板')
@@ -31,6 +32,7 @@ const nav = [
   { id: 'ct', label: '证书' },
   { id: 'cf', label: '服务配置' },
   { id: 'as', label: '登录页外观' },
+  { id: 'cn', label: '连接日志' },
   { id: 'lg', label: '日志' },
   { id: 'pn', label: '面板设置' }
 ]
@@ -115,6 +117,7 @@ onMounted(boot)
         <Cert v-else-if="view === 'ct'" :version="version" />
         <Settings v-else-if="view === 'cf'" />
         <Assets v-else-if="view === 'as'" />
+        <Connections v-else-if="view === 'cn'" />
         <Logs v-else-if="view === 'lg'" />
         <PanelSettings v-else-if="view === 'pn'" :version="version" />
       </main>

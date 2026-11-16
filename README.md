@@ -178,6 +178,7 @@ docker run -d --name ocserv-go -p 443:443 -p 443:443/udp \
 | `-style` | `asa` | 登录风格：`asa`（模拟 Cisco ASA）或 `ocserv`（标准 XML） |
 | `-dtls` | true | 启用 DTLS 数据面 |
 | `-dtls-port` | 同 `-addr` | DTLS 端口 |
+| `-conn-log` | `/etc/ocserv-go/connections.jsonl` | 连接日志（JSONL，只记连接成功；空=关闭） |
 | `-assets` | `/etc/ocserv-go/assets` | 用户上传的 Cisco 登录页资源目录（图片/CSS/logon.html） |
 | `-icmp-echo` | true | 客户端 ping 由服务端本地应答（echo reply，延迟 = 客户端到网关 RTT）；`false` 则不代答 |
 | `-http` | false | 明文 HTTP 预览模式（仅看页面） |
@@ -352,6 +353,8 @@ sudo ocserv-go panel -config /etc/ocserv-go/panel.json     # 默认 :19999
 - **VPN 用户**：增删用户、重置密码（写 `ocpasswd`，**改完立即生效**，靠文件热加载）
 - **证书**：查看当前证书、自签、上传 PEM、内置 Let's Encrypt（DNS-01）
 - **服务配置**：域名/端口/网段/MTU/DNS → 重写 systemd 单元并可一键重启
+- **连接日志**：只有**连接成功**的会话才会记录（时间 / 用户 / 来源 IP / 归属地 / 运营商 ASN），
+  支持搜索与 10 秒自动刷新
 - **日志**：`journalctl -u ocserv-go`（可自动刷新）
 - **面板设置**：改面板密码、查看路径
 
@@ -417,6 +420,23 @@ tar czf cisco-assets.tar.gz +CSCOE+ +CSCOU+
 | GET | `/api/assets` | 列出已导入文件、是否含 logon.html、限额 |
 | POST | `/api/assets` | 上传 `.tar.gz`（字段 `file`）并解包 |
 | DELETE | `/api/assets` | 清空，恢复内置占位页 |
+
+### 连接日志
+
+服务端在**隧道建立成功**时追加一行到 `-conn-log`（默认 `/etc/ocserv-go/connections.jsonl`，0600），
+格式为 JSONL：
+
+```json
+{"time":"2026-11-16T12:39:47Z","user":"alice","ip":"106.88.222.150",
+ "country":"China","region":"Sichuan","city":"Jiulong","isp":"China Telecom","asn":"4134"}
+```
+
+- 认证失败、只做了 HTTP 请求没建隧道的，都不会记录；
+- 归属地来自 [ip.sb 免费 API](https://ip.sb/api/)（`/geoip/<ip>`，无需 key，限流 100 次/分/来源 IP）：
+  **私有/环回地址不查询**，结果缓存 24 小时，查询失败只记录 `geoError` 字段，不影响连接；
+- 文件超过 5MB 自动轮转为 `connections.jsonl.1`。
+
+面板「连接日志」页读取该文件（`GET /api/connections?limit=&q=`，支持按 用户/IP/省市/运营商 搜索）。
 
 ### 前端开发
 

@@ -37,6 +37,7 @@ type Config struct {
 	AssetsDir     string                `json:"assetsDir"`
 	AcmeEnv       string                `json:"acmeEnv"`
 	AcmeState     string                `json:"acmeState"`
+	ConnLog       string                `json:"connLog"`
 	CertFile      string                `json:"certFile"`
 	KeyFile       string                `json:"keyFile"`
 	Domain        string                `json:"domain"`
@@ -61,6 +62,7 @@ func DefaultConfig() *Config {
 		AssetsDir:  "/etc/ocserv-go/assets",
 		AcmeEnv:    "/etc/ocserv-go/acme.env",
 		AcmeState:  "/etc/ocserv-go/acme.json",
+		ConnLog:    "/etc/ocserv-go/connections.jsonl",
 		VPNPort:    443,
 		VPNNet:     "10.66.66.0/24",
 		VPNMTU:     1400,
@@ -192,6 +194,9 @@ func (c *Config) normalize() {
 	}
 	if c.AcmeState == "" {
 		c.AcmeState = d.AcmeState
+	}
+	if c.ConnLog == "" {
+		c.ConnLog = d.ConnLog
 	}
 	if c.VPNPort == 0 {
 		c.VPNPort = d.VPNPort

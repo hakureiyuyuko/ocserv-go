@@ -21,6 +21,7 @@ import (
 
 	"github.com/hakureiyuyuko/ocserv-go/internal/acme"
 	"github.com/hakureiyuyuko/ocserv-go/internal/assets"
+	"github.com/hakureiyuyuko/ocserv-go/internal/connlog"
 )
 
 // Panel 是管理面板（API + 内嵌前端）。
@@ -57,6 +58,7 @@ func (p *Panel) Handler() http.Handler {
 	mux.HandleFunc("POST /api/users", p.withAuth(p.handleUsersPost))
 	mux.HandleFunc("POST /api/service", p.withAuth(p.handleService))
 	mux.HandleFunc("GET /api/logs", p.withAuth(p.handleLogs))
+	mux.HandleFunc("GET /api/connections", p.withAuth(p.handleConnections))
 	mux.HandleFunc("GET /api/assets", p.withAuth(p.handleAssetsGet))
 	mux.HandleFunc("POST /api/assets", p.withAuth(p.handleAssetsUpload))
 	mux.HandleFunc("DELETE /api/assets", p.withAuth(p.handleAssetsClear))
@@ -217,6 +219,21 @@ func (p *Panel) handleService(w http.ResponseWriter, r *http.Request, _ string) 
 	time.Sleep(800 * time.Millisecond)
 	active, enabled := p.ServiceState()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "active": active, "enabled": enabled})
+}
+
+// handleConnections 返回连接日志（最近 N 条，时间倒序）。
+func (p *Panel) handleConnections(w http.ResponseWriter, r *http.Request, _ string) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	user := strings.TrimSpace(r.URL.Query().Get("user"))
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	recs, total, err := connlog.Read(p.cfg.ConnLog, limit, user, q)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"records": recs, "count": len(recs), "total": total, "file": p.cfg.ConnLog,
+	})
 }
 
 func (p *Panel) handleLogs(w http.ResponseWriter, r *http.Request, _ string) {

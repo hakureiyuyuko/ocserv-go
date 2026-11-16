@@ -36,6 +36,8 @@ export const api = {
   passwd: (name, password) => req('POST', '/api/users', { action: 'passwd', name, password }),
 
   service: (action) => req('POST', '/api/service', { action }),
+  connections: (limit = 200, q = '') =>
+    req('GET', `/api/connections?limit=${limit}&q=${encodeURIComponent(q)}`),
   logs: (lines = 200) => req('GET', `/api/logs?lines=${lines}`),
 
   assets: () => req('GET', '/api/assets'),
