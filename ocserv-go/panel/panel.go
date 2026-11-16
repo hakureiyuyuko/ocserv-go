@@ -224,6 +224,9 @@ func (p *Panel) handleLogs(w http.ResponseWriter, r *http.Request, _ string) {
 
 func (p *Panel) handleAssetsGet(w http.ResponseWriter, _ *http.Request, _ string) {
 	files := assets.List(p.cfg.AssetsDir)
+	if files == nil {
+		files = []assets.File{} // 空时也要返回 []，否则前端拿到 null
+	}
 	hasLogon := false
 	for _, f := range files {
 		if strings.EqualFold(f.Path, "+CSCOE+/logon.html") {

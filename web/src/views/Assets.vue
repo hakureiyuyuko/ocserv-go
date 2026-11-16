@@ -106,7 +106,7 @@ onMounted(load)
       <span v-if="picked" class="muted mono">{{ picked.name }}</span>
     </div>
     <p v-if="info" class="muted" style="font-size:12px;margin:8px 0 0">
-      限制：包内总量 ≤ {{ info.limits.maxTotalMB }}MB、单文件 ≤ {{ info.limits.maxFileMB }}MB、最多 {{ info.limits.maxFiles }} 个文件；
+      限制：包内总量 ≤ {{ (info.limits || {}).maxTotalMB }}MB、单文件 ≤ {{ (info.limits || {}).maxFileMB }}MB、最多 {{ (info.limits || {}).maxFiles }} 个文件；
       只接受 <code>+CSCOT+</code> / <code>+CSCOU+</code> / <code>+CSCOE+</code> 下的路径。
     </p>
   </div>
@@ -116,10 +116,10 @@ onMounted(load)
     <div v-if="!info" class="muted">加载中…</div>
     <template v-else>
       <p class="muted" v-if="info.hasLogon">已包含 <code>+CSCOE+/logon.html</code>：登录页整页替换。</p>
-      <table v-if="info.files.length">
+      <table v-if="(info.files || []).length">
         <thead><tr><th>路径</th><th>大小</th></tr></thead>
         <tbody>
-          <tr v-for="f in info.files" :key="f.path">
+          <tr v-for="f in (info.files || [])" :key="f.path">
             <td class="mono">{{ f.path }}</td>
             <td class="mono">{{ (f.size / 1024).toFixed(1) }} KB</td>
           </tr>
@@ -127,7 +127,7 @@ onMounted(load)
       </table>
       <p v-else class="muted">还没有导入任何资源，当前使用内置占位页。</p>
       <div class="row" style="margin-top:12px">
-        <button class="danger" :disabled="!info.files.length" @click="clearAll">清空并恢复内置页</button>
+        <button class="danger" :disabled="!(info.files || []).length" @click="clearAll">清空并恢复内置页</button>
         <span class="muted mono">{{ info.dir }}</span>
       </div>
     </template>
