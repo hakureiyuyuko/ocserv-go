@@ -18,6 +18,9 @@
 #    --user NAME       创建一个 VPN 用户
 #    --password PW     该用户的密码（不给则随机生成并打印）
 #    --prefix DIR      二进制安装目录（默认 /usr/local/bin）
+#    --mtu N           隧道 MTU（默认 1400）
+#    --from-panel DIR  从老 Node 面板升级（默认自动探测 /opt/ocserv-panel）
+#    --no-migrate      不探测/迁移老面板，也不停用老的 C 版 ocserv
 #    --no-start        只写服务单元，不启动
 #    --uninstall       卸载（停服务、删单元与二进制，保留配置/证书/用户）
 # ============================================================================
@@ -41,6 +44,11 @@ VPN_PASS=""
 NO_START=0
 UNINSTALL=0
 SVC="ocserv-go"
+PANEL_DIR="/opt/ocserv-panel"   # 老 Node 面板默认位置
+MIGRATE=1
+FROM_PANEL=""
+DOMAIN_SET=0; PORT_SET=0; CERT_SET=0; KEY_SET=0; USERS_SET=0
+NET_SET=0; IP_SET=0; DNS_SET=0; MTU_SET=0
 
 say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 
@@ -68,20 +76,23 @@ die()  { printf '\033[1;31m错误：%s\033[0m\n' "$*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --domain)   DOMAIN="$2"; shift 2 ;;
-    --port)     PORT="$2"; shift 2 ;;
-    --cert)     CERT="$2"; shift 2 ;;
-    --key)      KEY="$2"; shift 2 ;;
-    --users)    USERS="$2"; shift 2 ;;
-    --net)      NET="$2"; shift 2 ;;
-    --ip)       IP="$2"; shift 2 ;;
-    --dns)      DNS="$2"; shift 2 ;;
+    --domain)   DOMAIN="$2"; DOMAIN_SET=1; shift 2 ;;
+    --port)     PORT="$2"; PORT_SET=1; shift 2 ;;
+    --cert)     CERT="$2"; CERT_SET=1; shift 2 ;;
+    --key)      KEY="$2"; KEY_SET=1; shift 2 ;;
+    --users)    USERS="$2"; USERS_SET=1; shift 2 ;;
+    --net)      NET="$2"; NET_SET=1; shift 2 ;;
+    --ip)       IP="$2"; IP_SET=1; shift 2 ;;
+    --dns)      DNS="$2"; DNS_SET=1; shift 2 ;;
+    --mtu)      MTU="$2"; MTU_SET=1; shift 2 ;;
     --user)     VPN_USER="$2"; shift 2 ;;
     --password) VPN_PASS="$2"; shift 2 ;;
     --prefix)   PREFIX="$2"; shift 2 ;;
+    --from-panel) FROM_PANEL="$2"; shift 2 ;;
+    --no-migrate) MIGRATE=0; shift ;;
     --no-start) NO_START=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
-    -h|--help)  sed -n '4,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)  sed -n '4,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "未知参数: $1" ;;
   esac
 done
@@ -139,6 +150,99 @@ say "环境"
 echo "    架构: $MACH ($ARCH)"
 echo "    初始化系统: $INIT"
 echo "    版本: $("$BIN_SRC" -version)"
+
+# ---------------------------------------------------------------- 老面板迁移（探测）
+# 老 Node 面板默认装在 /opt/ocserv-panel，配置里有证书/用户库/域名/端口。
+# 探测到就按迁移模式安装：沿用这些值、导入老面板账号、迁移 ACME 凭据、停用老服务。
+cfg_get() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$OLD_CFG" "$1" <<'PYGET' || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+v = d.get(sys.argv[2], "")
+if isinstance(v, (dict, list)):
+    v = ""
+if isinstance(v, bool):
+    v = "true" if v else "false"
+print(v)
+PYGET
+  else
+    sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\{0,1\}\([^",}]*\)"\{0,1\}.*/\1/p' "$OLD_CFG" 2>/dev/null | head -1
+  fi
+}
+
+MIGRATING=0
+OLD_CFG=""
+if [ "$MIGRATE" = 1 ]; then
+  if [ -n "$FROM_PANEL" ]; then
+    [ -f "$FROM_PANEL/config.json" ] || die "--from-panel 里没有 config.json: $FROM_PANEL"
+    OLD_CFG="$FROM_PANEL/config.json"
+  elif [ -f "$PANEL_DIR/config.json" ]; then
+    OLD_CFG="$PANEL_DIR/config.json"
+  elif [ "$INIT" = systemd ] && [ -f /etc/systemd/system/ocserv-panel.service ]; then
+    WD=$(sed -n 's/^WorkingDirectory=//p' /etc/systemd/system/ocserv-panel.service | head -1)
+    if [ -n "$WD" ] && [ -f "$WD/config.json" ]; then OLD_CFG="$WD/config.json"; fi
+  fi
+fi
+
+OLD_DOMAIN=""; OLD_CERT=""; OLD_KEY=""; OLD_USERS=""; OLD_SVC=""
+OLD_GOPORT=""; OLD_GONET=""; OLD_GODNS=""; OLD_GOMTU=""; OLD_PPORT=""
+
+if [ -n "$OLD_CFG" ]; then
+  MIGRATING=1
+  OLD_DOMAIN=$(cfg_get acmeDomain)
+  OLD_CERT=$(cfg_get certFile)
+  OLD_KEY=$(cfg_get keyFile)
+  OLD_USERS=$(cfg_get ocpasswd)
+  OLD_SVC=$(cfg_get ocservService)
+  OLD_GOPORT=$(cfg_get goPort)
+  OLD_GONET=$(cfg_get goNet)
+  OLD_GODNS=$(cfg_get goDNS)
+  OLD_GOMTU=$(cfg_get goMTU)
+  OLD_PPORT=$(cfg_get port)
+  [ -n "$OLD_PPORT" ] || OLD_PPORT=19999
+
+  # 用户没显式指定的参数，沿用老面板里的值
+  if [ "$DOMAIN_SET" = 0 ] && [ -n "$OLD_DOMAIN" ]; then DOMAIN="$OLD_DOMAIN"; fi
+  if [ "$PORT_SET" = 0 ] && [ -n "$OLD_GOPORT" ] && [ "$OLD_GOPORT" != "0" ]; then PORT="$OLD_GOPORT"; fi
+  if [ "$NET_SET" = 0 ] && [ -n "$OLD_GONET" ]; then NET="$OLD_GONET"; fi
+  if [ "$DNS_SET" = 0 ] && [ -n "$OLD_GODNS" ]; then DNS="$OLD_GODNS"; fi
+  if [ "$MTU_SET" = 0 ] && [ -n "$OLD_GOMTU" ] && [ "$OLD_GOMTU" != "0" ]; then MTU="$OLD_GOMTU"; fi
+
+  if [ "$CERT_SET" = 0 ]; then
+    if [ -n "$OLD_CERT" ] && [ -s "$OLD_CERT" ]; then
+      CERT="$OLD_CERT"
+    elif [ -s "/etc/ssl/securev/$DOMAIN/fullchain.pem" ]; then
+      CERT="/etc/ssl/securev/$DOMAIN/fullchain.pem"
+    fi
+  fi
+  if [ "$KEY_SET" = 0 ]; then
+    if [ -n "$OLD_KEY" ] && [ -s "$OLD_KEY" ]; then
+      KEY="$OLD_KEY"
+    elif [ -n "$CERT" ] && [ -s "$(dirname "$CERT")/privkey.pem" ]; then
+      KEY="$(dirname "$CERT")/privkey.pem"
+    fi
+  fi
+
+  # 用户库：老面板指向哪个文件就继续用那个文件；不是默认路径时复制过来，方便维护
+  if [ "$USERS_SET" = 0 ] && [ -n "$OLD_USERS" ] && [ -s "$OLD_USERS" ] && [ "$OLD_USERS" != "$USERS" ]; then
+    mkdir -p "$(dirname "$USERS")"
+    if [ ! -s "$USERS" ]; then
+      cp -p "$OLD_USERS" "$USERS" 2>/dev/null || true
+      if [ -s "$USERS" ]; then echo "    用户库已复制: $OLD_USERS -> $USERS"; fi
+    fi
+  fi
+
+  say "检测到老面板，按迁移模式安装"
+  echo "    老面板配置: $OLD_CFG"
+  echo "    沿用域名:   $DOMAIN"
+  echo "    沿用端口:   $PORT（面板 $OLD_PPORT）"
+  if [ -n "$CERT" ]; then echo "    沿用证书:   $CERT"; else echo "    证书:       老面板没有可用证书，稍后生成自签"; fi
+  echo "    沿用用户库: $USERS"
+fi
 
 # ---------------------------------------------------------------- 安装二进制
 say "安装二进制"
@@ -201,6 +305,63 @@ chmod 700 /etc/ocserv-go
 ASSETS=/etc/ocserv-go/assets
 ARGS="-addr :$PORT -users $USERS -cert $CERT -key $KEY -net $NET -ip $IP -dns $DNS -mtu $MTU -domain $DOMAIN -assets $ASSETS"
 
+# 没找到老面板配置但系统里有老 ocserv：只提醒（不动它，避免误伤）
+if [ "$MIGRATING" = 0 ]; then
+  case "$INIT" in
+    systemd)
+      if systemctl is-active ocserv >/dev/null 2>&1; then
+        warn "检测到老的 ocserv 服务正在运行，可能占用端口；要停用它：systemctl disable --now ocserv ocserv-nat ocserv-panel"
+      fi ;;
+    openrc)
+      if [ -f /etc/init.d/ocserv ] && rc-service ocserv status >/dev/null 2>&1; then
+        warn "检测到老的 ocserv 服务正在运行，可能占用端口；要停用它：rc-service ocserv stop && rc-update del ocserv default"
+      fi ;;
+  esac
+fi
+
+# ---------------------------------------------------------------- 停用老服务
+# 老面板在跑的话，老 C 版 ocserv 会占着同一个端口，必须先停掉再起新的。
+# 只 stop + disable，不删单元/配置，随时可以回滚。
+if [ "$MIGRATING" = 1 ]; then
+  say "停用老服务（保留文件，可回滚）"
+  BK="/var/backups/ocserv-go/migrate-$(date +%s)"
+  mkdir -p "$BK"
+  [ -f "$OLD_CFG" ] && cp -a "$OLD_CFG" "$BK/old-panel-config.json" 2>/dev/null || true
+  for f in /etc/systemd/system/ocserv.service /etc/systemd/system/ocserv-nat.service \
+           /etc/systemd/system/ocserv-panel.service /etc/init.d/ocserv /etc/init.d/ocserv-nat \
+           /etc/init.d/ocserv-panel /etc/ocserv/ocserv.conf; do
+    [ -e "$f" ] && cp -a "$f" "$BK/" 2>/dev/null || true
+  done
+  echo "    备份: $BK"
+
+  OLD_SERVICES=""
+  add_old_svc() {
+    case " $OLD_SERVICES " in
+      *" $1 "*) ;;
+      *) OLD_SERVICES="${OLD_SERVICES:+$OLD_SERVICES }$1" ;;
+    esac
+  }
+  [ -n "$OLD_SVC" ] && add_old_svc "$OLD_SVC"
+  add_old_svc ocserv
+  add_old_svc ocserv-nat
+  add_old_svc ocserv-panel
+  for svc in $OLD_SERVICES; do
+    case "$INIT" in
+      systemd)
+        if systemctl cat "$svc" >/dev/null 2>&1 || [ -f "/etc/systemd/system/$svc.service" ]; then
+          systemctl disable --now "$svc" >/dev/null 2>&1 || true
+          echo "    已停止并禁用: $svc"
+        fi ;;
+      openrc)
+        if [ -f "/etc/init.d/$svc" ]; then
+          rc-service "$svc" stop >/dev/null 2>&1 || true
+          rc-update del "$svc" default >/dev/null 2>&1 || true
+          echo "    已停止并移出 default: $svc"
+        fi ;;
+    esac
+  done
+fi
+
 # ---------------------------------------------------------------- 服务单元
 say "服务单元"
 case "$INIT" in
@@ -254,6 +415,8 @@ PANEL_CFG=/etc/ocserv-go/panel.json
 PANEL_PORT="${PANEL_PORT:-19999}"
 mkdir -p /etc/ocserv-go
 if [ ! -f "$PANEL_CFG" ]; then
+  # 迁移时沿用老面板的监听端口（书签/反代不用改）
+  if [ "$MIGRATING" = 1 ] && [ -n "$OLD_PPORT" ]; then PANEL_PORT="$OLD_PPORT"; fi
   PANEL_PW="$(openssl rand -base64 12 2>/dev/null | tr -dc 'A-Za-z0-9' | cut -c1-12 || true)"
   [ -n "$PANEL_PW" ] || PANEL_PW="admin123456"
   cat > "$PANEL_CFG" <<JSON
@@ -274,11 +437,68 @@ if [ ! -f "$PANEL_CFG" ]; then
 }
 JSON
   chmod 600 "$PANEL_CFG"
-  "$PREFIX/ocserv-go" panel -config "$PANEL_CFG" -set-password "admin:$PANEL_PW" -init >/dev/null 2>&1 \
-    || warn "面板配置初始化失败（可手动：ocserv-go panel -config $PANEL_CFG -set-password admin:新密码 -init）"
-  echo "    面板账号: admin / $PANEL_PW   （请尽快在面板里修改）"
+
+  if [ "$MIGRATING" = 1 ]; then
+    # -import 会把老面板的账号（scrypt）、证书路径、端口、用户库带过来
+    if PANEL_OUT=$("$PREFIX/ocserv-go" panel -config "$PANEL_CFG" -import "$OLD_CFG" -init 2>&1); then
+      echo "    已从老面板导入账号与设置（密码沿用老面板的，scrypt 兼容）"
+      printf '%s\n' "$PANEL_OUT" | grep '管理员账号' | sed 's/^/    /' || true
+    else
+      warn "从老面板导入失败（$PANEL_OUT），改为新建 admin"
+      "$PREFIX/ocserv-go" panel -config "$PANEL_CFG" -set-password "admin:$PANEL_PW" -init >/dev/null 2>&1 || true
+      echo "    面板账号: admin / $PANEL_PW   （请尽快在面板里修改）"
+    fi
+  else
+    "$PREFIX/ocserv-go" panel -config "$PANEL_CFG" -set-password "admin:$PANEL_PW" -init >/dev/null 2>&1 \
+      || warn "面板配置初始化失败（可手动：ocserv-go panel -config $PANEL_CFG -set-password admin:新密码 -init）"
+    echo "    面板账号: admin / $PANEL_PW   （请尽快在面板里修改）"
+  fi
 else
   echo "    已存在 $PANEL_CFG，保留现有配置与账号"
+fi
+
+# ---------------------------------------------------------------- ACME 凭据迁移
+# 老面板用 acme.sh 续期，DNS 服务商 API Key 存在 /root/.acme.sh/account.conf。
+# 迁移过来后内置续期循环可以直接接着用（不需要重新填 token）。
+if [ "$MIGRATING" = 1 ] && [ ! -f /etc/ocserv-go/acme.json ] && [ -n "$OLD_DOMAIN" ] && [ "$OLD_DOMAIN" = "$DOMAIN" ]; then
+  ACC=/root/.acme.sh/account.conf
+  if [ -f "$ACC" ]; then
+    acme_val() { sed -n "s/^SAVED_$1='\\{0,1\\}\\([^']*\\)'\\{0,1\\}\$/\\1/p" "$ACC" | head -1; }
+    CF_T=$(acme_val CF_Token)
+    ALI_K=$(acme_val Ali_Key);        ALI_S=$(acme_val Ali_Secret)
+    TC_ID=$(acme_val Tencent_SecretId); TC_K=$(acme_val Tencent_SecretKey)
+    DP_ID=$(acme_val DP_Id);          DP_K=$(acme_val DP_Key)
+    ACME_PROVIDER=""; ACME_ENV=""
+    if [ -n "$CF_T" ]; then
+      ACME_PROVIDER=cloudflare; ACME_ENV="CF_DNS_API_TOKEN=$CF_T"
+    elif [ -n "$ALI_K" ] && [ -n "$ALI_S" ]; then
+      ACME_PROVIDER=alidns
+      ACME_ENV="ALICLOUD_ACCESS_KEY=$ALI_K
+ALICLOUD_SECRET_KEY=$ALI_S"
+    elif [ -n "$TC_ID" ] && [ -n "$TC_K" ]; then
+      ACME_PROVIDER=tencentcloud
+      ACME_ENV="TENCENTCLOUD_SECRET_ID=$TC_ID
+TENCENTCLOUD_SECRET_KEY=$TC_K"
+    elif [ -n "$DP_ID" ] && [ -n "$DP_K" ]; then
+      ACME_PROVIDER=dnspod; ACME_ENV="DNSPOD_API_KEY=$DP_ID,$DP_K"
+    fi
+    if [ -n "$ACME_PROVIDER" ]; then
+      printf '%s\n' "$ACME_ENV" > /etc/ocserv-go/acme.env
+      chmod 600 /etc/ocserv-go/acme.env
+      cat > /etc/ocserv-go/acme.json <<JSON
+{
+  "domain": "$DOMAIN",
+  "provider": "$ACME_PROVIDER",
+  "envFile": "/etc/ocserv-go/acme.env",
+  "cacheDir": "/etc/ocserv-go/acme"
+}
+JSON
+      chmod 600 /etc/ocserv-go/acme.json
+      echo "    已迁移 ACME 凭据: $ACME_PROVIDER（来自 acme.sh，证书到期前自动续期）"
+    else
+      echo "    acme.sh 里没有可迁移的 DNS 凭据（可在面板「证书」页重新填写）"
+    fi
+  fi
 fi
 
 case "$INIT" in
@@ -338,6 +558,9 @@ echo "    服务状态: $ST"
 echo "    监听: TCP/UDP $PORT  客户端网段 $NET  隧道地址 $IP"
 echo "    用户库: $USERS"
 echo "    证书:   $CERT"
+if [ "$MIGRATING" = 1 ]; then
+echo "    迁移:   老面板已导入；老 ocserv / NAT / 面板服务已停用（未删除，可回滚）"
+fi
 echo
 echo "  客户端连接: 任意 AnyConnect 兼容客户端 → $DOMAIN:$PORT"
 case "$INIT" in
@@ -347,6 +570,7 @@ case "$INIT" in
 esac
 echo "  管理面板:   http://<本机IP>:$PANEL_PORT/  ($PANEL_STATUS_HINT)"
 echo
+if [ ! -f /etc/ocserv-go/acme.json ]; then
 echo "  换正式证书（内置 Let's Encrypt DNS-01，无需 80 端口）:"
 echo "    cat > /etc/ocserv-go/acme.env <<'EOF'"
 echo "    CF_DNS_API_TOKEN=xxxx        # 或 ALICLOUD_ACCESS_KEY/SECRET、TENCENTCLOUD_SECRET_ID/KEY、DNSPOD_API_KEY"
@@ -356,3 +580,6 @@ echo "    $PREFIX/ocserv-go -acme-once -acme-domain $DOMAIN -acme-dns cloudflare
 echo "      -acme-env /etc/ocserv-go/acme.env -acme-cache /etc/ocserv-go/acme \\"
 echo "      -cert $CERT -key $KEY"
 echo "    然后重启服务即可。"
+else
+echo "  内置 ACME 已配置（$(sed -n 's/.*"provider": *"\([^"]*\)".*/\1/p' /etc/ocserv-go/acme.json | head -1)）：证书到期前会自动续期，凭据在 /etc/ocserv-go/acme.env"
+fi

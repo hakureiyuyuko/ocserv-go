@@ -87,11 +87,42 @@ sudo ./install.sh --domain vpn.example.com --user alice
 - 缺 `openssl` 时会尝试用 `apk/apt/dnf` 自动补装
 - 支持 `--uninstall` 卸载（保留配置/证书/用户）
 
-常用参数：`--domain` `--port` `--cert` `--key` `--users` `--net` `--ip` `--dns`
-`--user` `--password` `--prefix` `--no-start`。
+常用参数：`--domain` `--port` `--cert` `--key` `--users` `--net` `--ip` `--dns` `--mtu`
+`--user` `--password` `--prefix` `--from-panel` `--no-migrate` `--no-start`。
 
 > 已在**无特权 LXC** 里实测：Alpine 3.24（OpenRC）与 Debian 13（systemd）都能一键装好、
 > 开机自启、TCP+UDP 监听并完成认证。
+
+## 从老面板（Node 版）升级，自动迁移
+
+`install.sh` 会先找 `/opt/ocserv-panel/config.json`（也可以用 `--from-panel DIR` 指定），
+找到就按**迁移模式**安装，不用手动抄配置：
+
+| 迁移什么 | 来源 | 结果 |
+|---|---|---|
+| 证书 | 老面板 `certFile` / `keyFile`（没有就找 `/etc/ssl/securev/<域名>/`） | 直接沿用，**不会用自签覆盖你的 Let's Encrypt 证书** |
+| VPN 用户 | 老 `ocpasswd`（bcrypt / `$5$` / `$6$` 都认） | 原样保留，客户端密码不变 |
+| 域名 / 端口 / 网段 / DNS / MTU | 老面板 `acmeDomain`、`goPort`、`goNet`、`goDNS`、`goMTU` | 沿用（显式传了参数则以参数为准） |
+| 面板账号 | 老面板 `users`（scrypt） | 导入到内置面板，**密码不变**，登录名照旧 |
+| 面板端口 | 老面板 `port` | 沿用（书签/反代不用改） |
+| DNS 服务商 API Key | `/root/.acme.sh/account.conf` 里的 `SAVED_CF_Token` / `SAVED_Ali_*` / `SAVED_Tencent_*` / `SAVED_DP_*` | 写成 `/etc/ocserv-go/acme.env` + `acme.json`（provider 自动识别），**内置自动续期直接接管**，不用重新填 token |
+| 老服务 | `ocserv` / `ocserv-nat` / `ocserv-panel` | **stop + disable / 移出 default 运行级**，文件不删（可回滚）；配置与单元备份到 `/var/backups/ocserv-go/migrate-<时间戳>/` |
+
+细节：
+
+```bash
+sudo ./install.sh                       # 自动探测并迁移
+sudo ./install.sh --from-panel /data/panel   # 老面板装在别处
+sudo ./install.sh --no-migrate          # 不迁移、也不动老服务
+```
+
+- 老证书还有效时不会触发签发；剩余 ≤30 天时内置续期会用它接管的 API Key 自动换新
+- 如果只找到老的 `ocserv` 服务、没有老面板配置，脚本不会动它，只提示你手动停用
+  （避免误伤）；确认后 `systemctl disable --now ocserv ocserv-nat ocserv-panel`
+- 回滚：`systemctl enable --now ocserv ocserv-nat ocserv-panel`
+  （OpenRC：`rc-update add ocserv default && rc-service ocserv start`），
+  再按需停掉 `ocserv-go` / `ocserv-go-panel`
+
 
 
 
