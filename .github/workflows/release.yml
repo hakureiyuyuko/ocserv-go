@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   build:
-    name: 构建发行包（amd64 / arm64）
+    name: 构建发行包（amd64 / amd64-v2 / amd64-v3 / arm64 / armhf / armel）
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,27 +54,42 @@ jobs:
       - name: 单元测试
         run: cd ocserv-go && go test ./...
 
-      - name: 构建 ocserv-go 发行包（amd64 / arm64 / armv7）
+      - name: 构建 ocserv-go 发行包（amd64 / v2 / v3 / arm64 / armhf / armel）
         run: |
           set -euo pipefail
           V='${{ steps.ver.outputs.version }}'
           mkdir -p dist/pkg
-          for ARCH in amd64 arm64 armv7; do
+          # amd64-v2/v3 是 x86-64 微架构等级（GOAMD64）；armhf/armel 是 Debian 的
+          # 硬浮点/软浮点 32 位 ARM（GOARM=7 / 5）
+          for ARCH in amd64 amd64-v2 amd64-v3 arm64 armhf armel; do
+            GOARCH=amd64; GOAMD64=v1; GOARM=
             case "$ARCH" in
-              amd64) GOARCH=amd64; GOARM= ;;
-              arm64) GOARCH=arm64; GOARM= ;;
-              armv7) GOARCH=arm;   GOARM=7 ;;
+              amd64)    GOARCH=amd64; GOAMD64=v1 ;;
+              amd64-v2) GOARCH=amd64; GOAMD64=v2 ;;
+              amd64-v3) GOARCH=amd64; GOAMD64=v3 ;;
+              arm64)    GOARCH=arm64 ;;
+              armhf)    GOARCH=arm;   GOARM=7 ;;
+              armel)    GOARCH=arm;   GOARM=5 ;;
             esac
             D="$GITHUB_WORKSPACE/dist/pkg/ocserv-go-${V}-linux-${ARCH}"
             mkdir -p "$D/bin"
-            ( cd ocserv-go && GOOS=linux GOARCH="$GOARCH" GOARM="$GOARM" CGO_ENABLED=0 \
+            ( cd ocserv-go && GOOS=linux GOARCH="$GOARCH" GOAMD64="$GOAMD64" GOARM="$GOARM" CGO_ENABLED=0 \
                 go build -trimpath -ldflags "-s -w" -o "$D/bin/ocserv-go" . )
             [ -s "$D/bin/ocserv-go" ] || { echo "构建产物缺失: $D/bin/ocserv-go"; exit 1; }
             file "$D/bin/ocserv-go"
-            # armv7 必须是 32 位 ARM，别把 64 位包发出去
-            if [ "$ARCH" = armv7 ] && ! file "$D/bin/ocserv-go" | grep -q 'ELF 32-bit'; then
-              echo "armv7 包不是 32 位 ELF"; exit 1
-            fi
+            # 32 位 ARM 包必须是 32 位 ELF
+            case "$ARCH" in
+              armhf|armel)
+                file "$D/bin/ocserv-go" | grep -q 'ELF 32-bit' || { echo "$ARCH 包不是 32 位 ELF"; exit 1; }
+                go version -m "$D/bin/ocserv-go" | grep -q "GOARM=$GOARM" || { echo "$ARCH 包的 GOARM 不是 $GOARM"; exit 1; }
+                ;;
+            esac
+            # x86-64 微架构等级要真的带上
+            case "$ARCH" in
+              amd64-v2|amd64-v3)
+                go version -m "$D/bin/ocserv-go" | grep -q "GOAMD64=$GOAMD64" || { echo "$ARCH 包的 GOAMD64 不是 $GOAMD64"; exit 1; }
+                ;;
+            esac
             cp ocserv-go/install.sh "$D/install.sh"
             chmod +x "$D/install.sh"
             cp LICENSE "$D/LICENSE"

@@ -69,9 +69,12 @@ ocserv-go
 从 [Releases](https://github.com/hakureiyuyuko/ocserv-go/releases) 下载对应架构：
 
 ```
-ocserv-go-1.1.3-linux-amd64.tar.gz     # x86_64
-ocserv-go-1.1.3-linux-arm64.tar.gz     # aarch64
-ocserv-go-1.1.3-linux-armv7.tar.gz     # ARM32（armv7l，机顶盒/老路由）
+ocserv-go-1.1.3-linux-amd64.tar.gz      # x86_64 基线（任何 x86-64）
+ocserv-go-1.1.3-linux-amd64-v2.tar.gz   # x86-64-v2（SSE4.2/POPCNT，Nehalem 之后）
+ocserv-go-1.1.3-linux-amd64-v3.tar.gz   # x86-64-v3（AVX2/BMI2，Haswell 之后）
+ocserv-go-1.1.3-linux-arm64.tar.gz      # aarch64
+ocserv-go-1.1.3-linux-armhf.tar.gz      # ARM32 硬浮点（Debian armhf，ARMv7 + VFPv3）
+ocserv-go-1.1.3-linux-armel.tar.gz      # ARM32 软浮点（Debian armel，ARMv5+、armv6l）
 ```
 
 ```bash
@@ -79,6 +82,10 @@ tar xzf ocserv-go-1.1.3-linux-amd64.tar.gz
 cd ocserv-go-1.1.3-linux-amd64
 sudo ./install.sh --domain vpn.example.com --user alice
 ```
+
+> `amd64-v2` / `amd64-v3` 是 x86-64 微架构等级（对应 `GOAMD64`），CPU 支持时性能更好；
+> 不确定就用 `amd64` 基线包。`armhf` / `armel` 的 `uname -m` 都是 `armv7l`，
+> `install.sh` 会按系统里的硬浮点加载器自动区分；`armv6l` 老设备请用 `armel` 包。
 
 `install.sh` 会自己判断环境：
 
@@ -586,8 +593,10 @@ Configured as 10.66.66.2, with SSL connected and DTLS connected
   `/var/log/ocserv-go.log` 日志页、设置页保存并重启）——都是 `install.sh` 装完即可用
 - **Docker**：Alpine 最小镜像（约 25 MB，`CGO_ENABLED=0`），面板托管模式启停 VPN，
   TCP+UDP 443 与面板端口都实测，`docker stop` 优雅退出
-- **ARM32（armv7）**：静态 32 位二进制在 QEMU armv7 容器里跑通安装、认证、CSTP 隧道与
-  ICMP 应答，`install.sh` 正确识别 `armv7l` 并选用 armv7 包
+- **ARM32**：`armhf`（`GOARM=7`）在 QEMU armv7 容器里跑通安装、认证、CSTP 隧道与 ICMP 应答；
+  `armel`（`GOARM=5`）跑通安装与启动，两个包都是 32 位静态 ELF，`install.sh` 能按系统区分
+- **x86-64 微架构包**：`amd64-v2` / `amd64-v3` 的 buildinfo 里确认带 `GOAMD64=v2/v3`，
+  `v3` 包在本机（Haswell+）跑通完整协议
 - 真机协议探针：`init → auth-request`、`/auth → complete`（带 `&sh:`）、`CONNECT 200`、
   隧道内 ICMP echo 应答，每版发版前复测
 

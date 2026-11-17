@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # ============================================================================
 #  ocserv-go 安装脚本（自适应）
-#  · 架构：x86_64(amd64) / aarch64(arm64) / armv7l —— 包内已带对应二进制
+#  · 架构：x86_64（amd64 / amd64-v2 / amd64-v3）/ aarch64 / armhf / armel —— 包内已带对应二进制
 #  · 初始化系统：systemd（Debian/Ubuntu）或 OpenRC（Alpine），没有则只装不托管
 #  · 用户态网络栈：不需要 tun / NET_ADMIN / iptables
 #
@@ -134,8 +134,16 @@ MACH=$(uname -m)
 case "$MACH" in
   x86_64|amd64)   ARCH=amd64 ;;
   aarch64|arm64)  ARCH=arm64 ;;
-  armv7l|armv7*)  ARCH=armv7 ;;
-  *) die "不支持的架构: $MACH（包提供 amd64 / arm64 / armv7）" ;;
+  armv7l|armv7*|armv8l)
+    # armhf 与 armel 的 uname 都是 armv7l，看有没有硬浮点动态加载器来区分
+    if [ -e /lib/ld-linux-armhf.so.3 ] || [ -e /lib/ld-musl-armhf.so.1 ] || [ -d /lib/arm-linux-gnueabihf ]; then
+      ARCH=armhf
+    else
+      ARCH=armel
+    fi ;;
+  armv6l|armv6*|armv5*)
+    ARCH=armel ;;
+  *) die "不支持的架构: $MACH（包提供 amd64 / amd64-v2 / amd64-v3 / arm64 / armhf / armel）" ;;
 esac
 
 BIN_SRC="$SRC/bin/ocserv-go"
