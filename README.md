@@ -4,7 +4,7 @@
 数据面换成 **gVisor 用户态 TCP/IP 栈** —— 所以**不需要 `/dev/net/tun`、不需要 `NET_ADMIN`、
 不需要 `iptables` / `ip_forward`**，无特权 LXC / Docker / PaaS 里都能跑。
 
-> 当前版本 **1.1.2**。这是一个**完整的独立实现**：Go 服务端 + 内置管理面板 + 安装脚本 +
+> 当前版本 **1.1.3**。这是一个**完整的独立实现**：Go 服务端 + 内置管理面板 + 安装脚本 +
 > Docker 镜像，运行时不依赖 C 版 ocserv，也不需要 Node.js。
 
 ## 仓库结构
@@ -69,13 +69,14 @@ ocserv-go
 从 [Releases](https://github.com/hakureiyuyuko/ocserv-go/releases) 下载对应架构：
 
 ```
-ocserv-go-1.1.2-linux-amd64.tar.gz     # x86_64
-ocserv-go-1.1.2-linux-arm64.tar.gz     # aarch64
+ocserv-go-1.1.3-linux-amd64.tar.gz     # x86_64
+ocserv-go-1.1.3-linux-arm64.tar.gz     # aarch64
+ocserv-go-1.1.3-linux-armv7.tar.gz     # ARM32（armv7l，机顶盒/老路由）
 ```
 
 ```bash
-tar xzf ocserv-go-1.1.2-linux-amd64.tar.gz
-cd ocserv-go-1.1.2-linux-amd64
+tar xzf ocserv-go-1.1.3-linux-amd64.tar.gz
+cd ocserv-go-1.1.3-linux-amd64
 sudo ./install.sh --domain vpn.example.com --user alice
 ```
 
@@ -237,7 +238,7 @@ docker exec ocserv-go ocserv-go hash '新密码'   # 打印 bcrypt 哈希
 （`docker-compose.yml` 里有注释好的写法）。镜像默认以 root 运行，只是为了绑 443。
 
 升级：`docker compose pull && docker compose up -d --build`，数据在挂载目录里不会丢。
-多架构：`docker buildx build --platform linux/amd64,linux/arm64 -t ... --push ./ocserv-go`。
+多架构：`docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 -t ... --push ./ocserv-go`。
 
 ### 6. 浏览器预览（只看页面）
 
@@ -585,6 +586,8 @@ Configured as 10.66.66.2, with SSL connected and DTLS connected
   `/var/log/ocserv-go.log` 日志页、设置页保存并重启）——都是 `install.sh` 装完即可用
 - **Docker**：Alpine 最小镜像（约 25 MB，`CGO_ENABLED=0`），面板托管模式启停 VPN，
   TCP+UDP 443 与面板端口都实测，`docker stop` 优雅退出
+- **ARM32（armv7）**：静态 32 位二进制在 QEMU armv7 容器里跑通安装、认证、CSTP 隧道与
+  ICMP 应答，`install.sh` 正确识别 `armv7l` 并选用 armv7 包
 - 真机协议探针：`init → auth-request`、`/auth → complete`（带 `&sh:`）、`CONNECT 200`、
   隧道内 ICMP echo 应答，每版发版前复测
 

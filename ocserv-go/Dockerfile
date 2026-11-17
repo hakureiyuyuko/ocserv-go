@@ -15,7 +15,8 @@
 # ---------------------------------------------------------------------------
 
 # ---------- 构建 ----------
-FROM golang:1.27-alpine AS build
+# 用构建机自己的架构跑编译器（buildx 多架构时避免 QEMU 慢速编译），再交叉编译到目标架构
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 WORKDIR /src
 RUN apk add --no-cache git
 # 先只拷依赖清单，命中缓存时不用重下模块
@@ -24,11 +25,14 @@ RUN go mod download
 COPY . ./
 ARG TARGETOS
 ARG TARGETARCH
+ARG TARGETVARIANT
 RUN set -eu; \
     goos="${TARGETOS:-$(go env GOOS)}"; \
     goarch="${TARGETARCH:-$(go env GOARCH)}"; \
-    echo "构建 $goos/$goarch"; \
-    CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+    goarm=""; \
+    if [ "$goarch" = "arm" ]; then goarm="${TARGETVARIANT#v}"; [ -n "$goarm" ] || goarm=7; fi; \
+    echo "构建 $goos/$goarch${goarm:+ GOARM=$goarm}"; \
+    CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" GOARM="$goarm" \
       go build -trimpath -ldflags "-s -w" -o /out/ocserv-go .
 
 # ---------- 运行 ----------

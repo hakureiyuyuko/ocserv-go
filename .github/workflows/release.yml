@@ -54,17 +54,27 @@ jobs:
       - name: 单元测试
         run: cd ocserv-go && go test ./...
 
-      - name: 构建 ocserv-go 发行包（amd64 / arm64）
+      - name: 构建 ocserv-go 发行包（amd64 / arm64 / armv7）
         run: |
           set -euo pipefail
           V='${{ steps.ver.outputs.version }}'
           mkdir -p dist/pkg
-          for ARCH in amd64 arm64; do
+          for ARCH in amd64 arm64 armv7; do
+            case "$ARCH" in
+              amd64) GOARCH=amd64; GOARM= ;;
+              arm64) GOARCH=arm64; GOARM= ;;
+              armv7) GOARCH=arm;   GOARM=7 ;;
+            esac
             D="$GITHUB_WORKSPACE/dist/pkg/ocserv-go-${V}-linux-${ARCH}"
             mkdir -p "$D/bin"
-            ( cd ocserv-go && GOOS=linux GOARCH="$ARCH" CGO_ENABLED=0 \
+            ( cd ocserv-go && GOOS=linux GOARCH="$GOARCH" GOARM="$GOARM" CGO_ENABLED=0 \
                 go build -trimpath -ldflags "-s -w" -o "$D/bin/ocserv-go" . )
             [ -s "$D/bin/ocserv-go" ] || { echo "构建产物缺失: $D/bin/ocserv-go"; exit 1; }
+            file "$D/bin/ocserv-go"
+            # armv7 必须是 32 位 ARM，别把 64 位包发出去
+            if [ "$ARCH" = armv7 ] && ! file "$D/bin/ocserv-go" | grep -q 'ELF 32-bit'; then
+              echo "armv7 包不是 32 位 ELF"; exit 1
+            fi
             cp ocserv-go/install.sh "$D/install.sh"
             chmod +x "$D/install.sh"
             cp LICENSE "$D/LICENSE"
