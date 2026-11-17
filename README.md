@@ -122,6 +122,9 @@ sudo ./install.sh --no-migrate          # 不迁移、也不动老服务
 - 回滚：`systemctl enable --now ocserv ocserv-nat ocserv-panel`
   （OpenRC：`rc-update add ocserv default && rc-service ocserv start`），
   再按需停掉 `ocserv-go` / `ocserv-go-panel`
+- 已经装过 ocserv-go 的机器重跑 `install.sh`（升级/修复）时，会**沿用
+  `/etc/ocserv-go/panel.json` 里的端口、网段、MTU、DNS、证书**，不会打回默认值；
+  想改回默认就显式传对应参数
 
 
 

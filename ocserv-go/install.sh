@@ -244,6 +244,42 @@ if [ -n "$OLD_CFG" ]; then
   echo "    沿用用户库: $USERS"
 fi
 
+# ---------------------------------------------------------------- 已有面板配置（重装/升级）
+# 这台机器以前装过 ocserv-go：端口/网段/证书等可能已经在面板里改过，
+# 重跑 install.sh 时沿用 panel.json，避免把参数打回默认值（比如把 8443 改回 443）。
+PANEL_CFG=/etc/ocserv-go/panel.json
+if [ "$MIGRATING" = 0 ] && [ -f "$PANEL_CFG" ]; then
+  OLD_CFG="$PANEL_CFG"
+  EX_DOMAIN=$(cfg_get domain)
+  EX_PORT=$(cfg_get vpnPort)
+  EX_NET=$(cfg_get vpnNet)
+  EX_MTU=$(cfg_get vpnMtu)
+  EX_CERT=$(cfg_get certFile)
+  EX_KEY=$(cfg_get keyFile)
+  EX_USERS=$(cfg_get usersFile)
+  EX_LISTEN=$(cfg_get listen)
+  EX_DNS=$(tr -d '\n' < "$PANEL_CFG" | sed -n 's/.*"vpnDns"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' | tr -d '" ' | sed 's/,$//')
+  OLD_CFG=""
+
+  if [ "$DOMAIN_SET" = 0 ] && [ -n "$EX_DOMAIN" ]; then DOMAIN="$EX_DOMAIN"; fi
+  if [ "$PORT_SET" = 0 ] && [ -n "$EX_PORT" ] && [ "$EX_PORT" != "0" ]; then PORT="$EX_PORT"; fi
+  if [ "$NET_SET" = 0 ] && [ -n "$EX_NET" ]; then NET="$EX_NET"; fi
+  if [ "$MTU_SET" = 0 ] && [ -n "$EX_MTU" ] && [ "$EX_MTU" != "0" ]; then MTU="$EX_MTU"; fi
+  if [ "$DNS_SET" = 0 ] && [ -n "$EX_DNS" ]; then DNS="$EX_DNS"; fi
+  if [ "$CERT_SET" = 0 ] && [ -n "$EX_CERT" ] && [ -s "$EX_CERT" ]; then CERT="$EX_CERT"; fi
+  if [ "$KEY_SET" = 0 ] && [ -n "$EX_KEY" ] && [ -s "$EX_KEY" ]; then KEY="$EX_KEY"; fi
+  if [ "$USERS_SET" = 0 ] && [ -n "$EX_USERS" ] && [ -s "$EX_USERS" ] && [ "$EX_USERS" != "$USERS" ] && [ ! -s "$USERS" ]; then
+    mkdir -p "$(dirname "$USERS")"
+    cp -p "$EX_USERS" "$USERS" 2>/dev/null || true
+  fi
+
+  say "检测到已有面板配置，沿用其中的参数"
+  echo "    $PANEL_CFG"
+  echo "    域名/端口: $DOMAIN / $PORT"
+  echo "    网段/MTU:  $NET / $MTU"
+  [ -n "$EX_LISTEN" ] && echo "    面板监听:  $EX_LISTEN"
+fi
+
 # ---------------------------------------------------------------- 安装二进制
 say "安装二进制"
 mkdir -p "$PREFIX"
