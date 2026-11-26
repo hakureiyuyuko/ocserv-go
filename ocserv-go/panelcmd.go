@@ -98,7 +98,11 @@ func runPanel() int {
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 		stopSupervisor = stop
 		go sup.Run(ctx)
-		log.Printf("容器模式: 面板托管 VPN 进程 %s %s", cfg.Bin, strings.Join(sup.Args(), " "))
+		// 只记录二进制路径：参数里含用户库/证书路径，没必要写进日志
+		log.Printf("容器模式: 面板托管 VPN 进程（%s）", cfg.Bin)
+		if *verbose {
+			log.Printf("  参数: %s", strings.Join(sup.Args(), " "))
+		}
 	}
 
 	srv := &http.Server{

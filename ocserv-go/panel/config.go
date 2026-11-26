@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/crypto/scrypt"
 )
 
@@ -213,10 +214,10 @@ func (c *Config) normalize() {
 	if c.PanelUsers == nil {
 		c.PanelUsers = map[string]Credential{}
 	}
-	if c.CertFile == "" && c.Domain != "" {
+	if c.CertFile == "" && ValidDomain(c.Domain) {
 		c.CertFile = filepath.Join(certDir(c.Domain), "fullchain.pem")
 	}
-	if c.KeyFile == "" && c.Domain != "" {
+	if c.KeyFile == "" && ValidDomain(c.Domain) {
 		c.KeyFile = filepath.Join(certDir(c.Domain), "privkey.pem")
 	}
 	if c.SessionSecret == "" {
@@ -225,7 +226,10 @@ func (c *Config) normalize() {
 }
 
 // certDir 是套件约定的证书目录。
-func certDir(domain string) string { return filepath.Join("/etc/ssl/securev", domain) }
+// certRoot 是证书根目录；域名校验通过后才会拼进来。
+const certRoot = "/etc/ssl/securev"
+
+func certDir(domain string) string { return filepath.Join(certRoot, domain) }
 
 // Save 原子写回配置文件（0600）。
 func (c *Config) Save() error {
@@ -255,33 +259,39 @@ func randomHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
-// HashPassword 生成 Credential（加盐 SHA-256，与旧面板一致）。
+// HashPassword 生成 Credential（bcrypt，cost=12）。
+//
+// 新写入的密码一律用 bcrypt；老的加盐 SHA-256（本面板 1.1.4 之前）与
+// 旧 Node 面板的 scrypt 仍然能校验，登录成功后会顺手升级成 bcrypt。
 func HashPassword(pw string) Credential {
-	salt := randomHex(16)
-	sum := sha256.Sum256([]byte(salt + pw))
-	return Credential{Salt: salt, Hash: hex.EncodeToString(sum[:])}
+	h, err := bcrypt.GenerateFromPassword([]byte(pw), 12)
+	if err != nil {
+		// 极端情况（密码超长）退回一个不可登录的占位，避免把明文写盘
+		return Credential{Hash: "!"}
+	}
+	return Credential{Hash: string(h)}
 }
 
-// VerifyPassword 校验密码（常数时间比较）。
-//
-// 兼容两种摘要：
-//   - 本面板：加盐 SHA-256（64 个 hex 字符）
-//   - 旧 Node 面板：crypto.scryptSync(pw, salt, 64)（128 个 hex 字符，N=16384,r=8,p=1）
-//
-// 这样从旧面板迁移过来的账号不用重设密码。
+// VerifyPassword 校验密码（bcrypt / 旧的加盐 SHA-256 / 旧 Node 面板的 scrypt）。
 func VerifyPassword(pw string, c Credential) bool {
-	if c.Hash == "" || c.Salt == "" {
+	if c.Hash == "" {
+		return false
+	}
+	if strings.HasPrefix(c.Hash, "$2") { // bcrypt
+		return bcrypt.CompareHashAndPassword([]byte(c.Hash), []byte(pw)) == nil
+	}
+	if c.Salt == "" {
 		return false
 	}
 	var got string
 	switch len(c.Hash) {
-	case 128:
+	case 128: // 旧 Node 面板：crypto.scryptSync(pw, salt, 64)
 		k, err := scrypt.Key([]byte(pw), []byte(c.Salt), 16384, 8, 1, 64)
 		if err != nil {
 			return false
 		}
 		got = hex.EncodeToString(k)
-	default:
+	default: // 1.1.4 之前本面板的加盐 SHA-256（登录后会自动升级）
 		sum := sha256.Sum256([]byte(c.Salt + pw))
 		got = hex.EncodeToString(sum[:])
 	}
@@ -290,6 +300,38 @@ func VerifyPassword(pw string, c Credential) bool {
 
 // IsLegacyScrypt 判断这条凭据是否来自旧 Node 面板（scrypt）。
 func (c Credential) IsLegacyScrypt() bool { return len(c.Hash) == 128 }
+
+// NeedsUpgrade 判断这条凭据是不是老格式（bcrypt 之前），登录成功后应重写。
+func (c Credential) NeedsUpgrade() bool { return c.Hash != "" && !strings.HasPrefix(c.Hash, "$2") }
+
+// ValidDomain 校验证书域名：只允许主机名字符（字母数字、点、横线、下划线），
+// 拒绝路径分隔符、.. 与超长输入 —— 否则 domain 会被拼成 /etc/ssl/securev 之外的路径。
+func ValidDomain(d string) bool {
+	if d == "" || len(d) > 253 {
+		return false
+	}
+	if strings.Contains(d, "..") || strings.HasPrefix(d, ".") || strings.HasSuffix(d, ".") {
+		return false
+	}
+	for _, r := range d {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '.', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// within 判断 p 是否真的在 dir 里面（挡住 .. 和前缀相似的兄弟目录）。
+func within(dir, p string) bool {
+	rel, err := filepath.Rel(dir, p)
+	if err != nil || rel == "." || filepath.IsAbs(rel) {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
 
 // PanelUsersNames 返回面板账号名（排序后），用于日志展示。
 func (c *Config) PanelUsersNames() []string {

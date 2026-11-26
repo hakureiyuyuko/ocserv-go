@@ -141,14 +141,19 @@ func (p *Panel) handleLogin(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusUnauthorized, "用户名或密码错误")
 		return
 	}
+	// 老格式（sha256 / 迁移来的 scrypt）登录成功后升级成 bcrypt
+	if cred.NeedsUpgrade() {
+		p.cfg.PanelUsers[in.Username] = HashPassword(in.Password)
+		_ = p.cfg.Save()
+	}
 	tok := p.sessions.create(in.Username, 12*time.Hour)
-	http.SetCookie(w, &http.Cookie{Name: "sid", Value: tok, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: 12 * 3600})
+	http.SetCookie(w, &http.Cookie{Name: "sid", Value: tok, Path: "/", HttpOnly: true, Secure: r.TLS != nil, SameSite: http.SameSiteStrictMode, MaxAge: 12 * 3600})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "user": in.Username})
 }
 
 func (p *Panel) handleLogout(w http.ResponseWriter, r *http.Request, _ string) {
 	p.sessions.drop(sessionToken(r))
-	http.SetCookie(w, &http.Cookie{Name: "sid", Value: "", Path: "/", MaxAge: -1, HttpOnly: true})
+	http.SetCookie(w, &http.Cookie{Name: "sid", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: r.TLS != nil})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -380,9 +385,17 @@ func (p *Panel) handleCertPost(w http.ResponseWriter, r *http.Request, _ string)
 		fail(w, http.StatusBadRequest, "请先填写域名")
 		return
 	}
+	if !ValidDomain(domain) {
+		fail(w, http.StatusBadRequest, "域名不合法（只允许字母数字、点、横线、下划线）")
+		return
+	}
 	certDir := certDir(domain)
 	certFile := certDir + "/fullchain.pem"
 	keyFile := certDir + "/privkey.pem"
+	if !within(certRoot, certDir) || !within(certRoot, certFile) || !within(certRoot, keyFile) {
+		fail(w, http.StatusBadRequest, "证书路径不合法")
+		return
+	}
 
 	switch in.Action {
 	case "selfsigned":
@@ -521,6 +534,10 @@ func (p *Panel) handleConfigPost(w http.ResponseWriter, r *http.Request, _ strin
 	}
 	if len(in.VPNDNS) == 0 {
 		fail(w, http.StatusBadRequest, "至少填一个 DNS")
+		return
+	}
+	if d := strings.TrimSpace(in.Domain); d != "" && !ValidDomain(d) {
+		fail(w, http.StatusBadRequest, "域名不合法（只允许字母数字、点、横线、下划线）")
 		return
 	}
 	p.cfg.Domain = strings.TrimSpace(in.Domain)

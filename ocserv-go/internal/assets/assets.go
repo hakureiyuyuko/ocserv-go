@@ -85,6 +85,12 @@ func Extract(r io.Reader, dir string) ([]File, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
+	// os.Root：即使目录里混进软链，也访问不到 dir 之外的路径
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
 
 	tr := tar.NewReader(gz)
 	var total int64
@@ -126,11 +132,16 @@ func Extract(r io.Reader, dir string) ([]File, error) {
 			return nil, fmt.Errorf("包内文件数超过 %d", MaxFiles)
 		}
 
-		dst := filepath.Join(dir, filepath.FromSlash(name))
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			return nil, err
+		rel := filepath.FromSlash(name)
+		if !filepath.IsLocal(rel) {
+			return nil, fmt.Errorf("非法路径: %q", name)
 		}
-		f, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+		if d := path.Dir(name); d != "." {
+			if err := root.MkdirAll(filepath.FromSlash(d), 0o755); err != nil {
+				return nil, err
+			}
+		}
+		f, err := root.OpenFile(rel, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 		if err != nil {
 			return nil, err
 		}
@@ -159,7 +170,7 @@ func Extract(r io.Reader, dir string) ([]File, error) {
 			return nil, cerr
 		}
 		if n > MaxFileSize {
-			_ = os.Remove(dst)
+			_ = root.Remove(rel)
 			return nil, fmt.Errorf("%s 超过单文件上限", name)
 		}
 		out = append(out, File{Path: name, Size: n, Mtime: time.Now()})
@@ -168,21 +179,45 @@ func Extract(r io.Reader, dir string) ([]File, error) {
 	return out, nil
 }
 
-// Lookup 在 dir 下找 urlPath 对应的文件（只允许官方目录树），返回绝对路径。
-func Lookup(dir, urlPath string) (string, bool) {
+// Open 在 dir 下打开 urlPath 对应的文件（只允许官方目录树）。
+// 用 os.Root，路径或软链都出不了 dir；返回的 *os.File 由调用方关闭。
+func Open(dir, urlPath string) (*os.File, string, bool) {
 	if dir == "" {
-		return "", false
+		return nil, "", false
 	}
 	name, err := CleanName(urlPath)
 	if err != nil || !allowedTop(name) {
-		return "", false
+		return nil, "", false
 	}
-	p := filepath.Join(dir, filepath.FromSlash(name))
-	st, err := os.Stat(p)
+	rel := filepath.FromSlash(name)
+	if !filepath.IsLocal(rel) {
+		return nil, "", false
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, "", false
+	}
+	defer root.Close()
+	f, err := root.Open(rel)
+	if err != nil {
+		return nil, "", false
+	}
+	st, err := f.Stat()
 	if err != nil || st.IsDir() {
+		_ = f.Close()
+		return nil, "", false
+	}
+	return f, name, true
+}
+
+// Lookup 是 Open 的旧接口（返回绝对路径），保留给测试与调用方。
+func Lookup(dir, urlPath string) (string, bool) {
+	f, name, ok := Open(dir, urlPath)
+	if !ok {
 		return "", false
 	}
-	return p, true
+	_ = f.Close()
+	return filepath.Join(dir, filepath.FromSlash(name)), true
 }
 
 // List 列出 dir 下已上传的文件。

@@ -2,6 +2,7 @@ package panel
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"os"
 	"path/filepath"
@@ -20,8 +21,45 @@ func TestHashVerify(t *testing.T) {
 	if VerifyPassword("wrong", c) {
 		t.Fatal("错误密码不应通过")
 	}
-	if c.Salt == "" || len(c.Hash) != 64 {
-		t.Fatalf("摘要格式不对: %+v", c)
+	if !strings.HasPrefix(c.Hash, "$2") {
+		t.Fatalf("新密码应存 bcrypt: %+v", c)
+	}
+	if c.NeedsUpgrade() {
+		t.Fatal("bcrypt 不需要升级")
+	}
+}
+
+func TestVerifyLegacySHA256(t *testing.T) {
+	salt := "0123456789abcdef0123456789abcdef"
+	sum := sha256.Sum256([]byte(salt + "oldpass"))
+	cred := Credential{Salt: salt, Hash: hex.EncodeToString(sum[:])}
+	if !VerifyPassword("oldpass", cred) {
+		t.Fatal("旧 sha256 摘要应能校验")
+	}
+	if VerifyPassword("bad", cred) {
+		t.Fatal("错误密码不应通过")
+	}
+	if !cred.NeedsUpgrade() {
+		t.Fatal("旧 sha256 应标记为需要升级")
+	}
+}
+
+func TestValidDomain(t *testing.T) {
+	good := []string{"vpn.example.com", "a", "a-b_c.example", "192.168.1.1", "vpn.49.test"}
+	for _, d := range good {
+		if !ValidDomain(d) {
+			t.Fatalf("应该合法: %q", d)
+		}
+		if !within(certRoot, certDir(d)) {
+			t.Fatalf("证书目录应在 %s 下: %q", certRoot, d)
+		}
+	}
+	bad := []string{"", "..", "../../etc/passwd", "a/b", ".hidden", "a..b", "vpn.example.com/",
+		strings.Repeat("a", 254), "exa mple.com", "*.example.com", "a\\b"}
+	for _, d := range bad {
+		if ValidDomain(d) {
+			t.Fatalf("应该拒绝: %q", d)
+		}
 	}
 }
 
@@ -156,6 +194,9 @@ func TestVerifyLegacyScrypt(t *testing.T) {
 	cred := Credential{Salt: salt, Hash: hex.EncodeToString(k)}
 	if !cred.IsLegacyScrypt() {
 		t.Fatal("应识别为 legacy scrypt")
+	}
+	if !cred.NeedsUpgrade() {
+		t.Fatal("scrypt 摘要应标记为需要升级")
 	}
 	if !VerifyPassword(pw, cred) {
 		t.Fatal("scrypt 摘要应能通过校验")

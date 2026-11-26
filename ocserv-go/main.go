@@ -508,10 +508,7 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 		s.handleInit(w, r, body)
 	case p == "/+CSCOE+/logon.html":
 		if r.Method == http.MethodGet {
-			if f, ok := assets.Lookup(s.assetsDir, p); ok {
-				w.Header().Set("Content-Type", assets.ContentType(f))
-				w.Header().Set("Cache-Control", "no-cache")
-				http.ServeFile(w, r, f)
+			if s.serveAsset(w, r, p, "no-cache") {
 				return
 			}
 			s.handleLogonPage(w, r, "")
@@ -542,14 +539,31 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// serveAsset 优先返回用户上传的登录页资源。
+// 用 assets.Open 打开（内部 os.Root），不把用户给的路径直接交给 ServeFile。
+func (s *server) serveAsset(w http.ResponseWriter, r *http.Request, p, cache string) bool {
+	f, name, ok := assets.Open(s.assetsDir, p)
+	if !ok {
+		return false
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.IsDir() {
+		return false
+	}
+	w.Header().Set("Content-Type", assets.ContentType(name))
+	if cache != "" {
+		w.Header().Set("Cache-Control", cache)
+	}
+	http.ServeContent(w, r, name, st.ModTime(), f)
+	return true
+}
+
 // serveASAStatic 复刻真机会被扫描器探测的静态资源路径（内容是自绘的占位）。
 func (s *server) serveASAStatic(w http.ResponseWriter, r *http.Request, p string) bool {
 	// 用户自己上传的 Cisco 资源优先（我们不自带厂商素材）
 	if r.Method == http.MethodGet {
-		if f, ok := assets.Lookup(s.assetsDir, p); ok {
-			w.Header().Set("Content-Type", assets.ContentType(f))
-			w.Header().Set("Cache-Control", "public, max-age=3600")
-			http.ServeFile(w, r, f)
+		if s.serveAsset(w, r, p, "public, max-age=3600") {
 			return true
 		}
 	}
@@ -639,7 +653,7 @@ func (s *server) handleRootGET(w http.ResponseWriter, r *http.Request) {
 	for _, n := range []string{"webvpn", "webvpnc", "webvpn_portal", "webvpn_as", "webvpnSharePoint"} {
 		s.expiredCookie(w, n)
 	}
-	http.SetCookie(w, &http.Cookie{Name: "webvpnlogin", Value: "1", Path: "/", Secure: s.secure})
+	http.SetCookie(w, &http.Cookie{Name: "webvpnlogin", Value: "1", Path: "/", HttpOnly: true, Secure: s.secure})
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(asa.HTMLRedirect())
@@ -650,7 +664,7 @@ func (s *server) handleASALoginPage(w http.ResponseWriter, r *http.Request) {
 	for _, n := range []string{"webvpn", "webvpn_as", "webvpnc"} {
 		s.expiredCookie(w, n)
 	}
-	http.SetCookie(w, &http.Cookie{Name: "webvpnlogin", Value: "1", Path: "/", Secure: s.secure})
+	http.SetCookie(w, &http.Cookie{Name: "webvpnlogin", Value: "1", Path: "/", HttpOnly: true, Secure: s.secure})
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 	w.Header().Set("X-Transcend-Version", "1")
 	w.WriteHeader(http.StatusOK)
