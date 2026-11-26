@@ -291,7 +291,9 @@ func VerifyPassword(pw string, c Credential) bool {
 			return false
 		}
 		got = hex.EncodeToString(k)
-	default: // 1.1.4 之前本面板的加盐 SHA-256（登录后会自动升级）
+	default:
+		// 仅用于校验 1.1.4 之前的历史摘要；登录成功后立刻重写为 bcrypt（见 NeedsUpgrade）。
+		// lgtm[go/weak-sensitive-data-hashing] 兼容路径，不能改成慢哈希
 		sum := sha256.Sum256([]byte(c.Salt + pw))
 		got = hex.EncodeToString(sum[:])
 	}

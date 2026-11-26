@@ -44,7 +44,7 @@ import (
 	"github.com/hakureiyuyuko/ocserv-go/internal/usrnet"
 )
 
-const version = "1.1.3"
+const version = "1.1.4"
 
 var (
 	addr        = flag.String("addr", ":443", "监听地址")

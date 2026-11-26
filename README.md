@@ -4,7 +4,7 @@
 数据面换成 **gVisor 用户态 TCP/IP 栈** —— 所以**不需要 `/dev/net/tun`、不需要 `NET_ADMIN`、
 不需要 `iptables` / `ip_forward`**，无特权 LXC / Docker / PaaS 里都能跑。
 
-> 当前版本 **1.1.3**。这是一个**完整的独立实现**：Go 服务端 + 内置管理面板 + 安装脚本 +
+> 当前版本 **1.1.4**。这是一个**完整的独立实现**：Go 服务端 + 内置管理面板 + 安装脚本 +
 > Docker 镜像，运行时不依赖 C 版 ocserv，也不需要 Node.js。
 
 ## 仓库结构
@@ -69,17 +69,17 @@ ocserv-go
 从 [Releases](https://github.com/hakureiyuyuko/ocserv-go/releases) 下载对应架构：
 
 ```
-ocserv-go-1.1.3-linux-amd64.tar.gz      # x86_64 基线（任何 x86-64）
-ocserv-go-1.1.3-linux-amd64-v2.tar.gz   # x86-64-v2（SSE4.2/POPCNT，Nehalem 之后）
-ocserv-go-1.1.3-linux-amd64-v3.tar.gz   # x86-64-v3（AVX2/BMI2，Haswell 之后）
-ocserv-go-1.1.3-linux-arm64.tar.gz      # aarch64
-ocserv-go-1.1.3-linux-armhf.tar.gz      # ARM32 硬浮点（Debian armhf，ARMv7 + VFPv3）
-ocserv-go-1.1.3-linux-armel.tar.gz      # ARM32 软浮点（Debian armel，ARMv5+、armv6l）
+ocserv-go-1.1.4-linux-amd64.tar.gz      # x86_64 基线（任何 x86-64）
+ocserv-go-1.1.4-linux-amd64-v2.tar.gz   # x86-64-v2（SSE4.2/POPCNT，Nehalem 之后）
+ocserv-go-1.1.4-linux-amd64-v3.tar.gz   # x86-64-v3（AVX2/BMI2，Haswell 之后）
+ocserv-go-1.1.4-linux-arm64.tar.gz      # aarch64
+ocserv-go-1.1.4-linux-armhf.tar.gz      # ARM32 硬浮点（Debian armhf，ARMv7 + VFPv3）
+ocserv-go-1.1.4-linux-armel.tar.gz      # ARM32 软浮点（Debian armel，ARMv5+、armv6l）
 ```
 
 ```bash
-tar xzf ocserv-go-1.1.3-linux-amd64.tar.gz
-cd ocserv-go-1.1.3-linux-amd64
+tar xzf ocserv-go-1.1.4-linux-amd64.tar.gz
+cd ocserv-go-1.1.4-linux-amd64
 sudo ./install.sh --domain vpn.example.com --user alice
 ```
 
@@ -681,6 +681,20 @@ ocserv-go/
 - [ ] 带宽限制与在线审计
 - [x] 多架构镜像与 CI（Alpine 最小镜像 + `go test`）
 - [ ] 面板里显示内置 ACME 的账号/到期信息
+
+## 安全说明
+
+- **面板密码**：1.1.4 起用 **bcrypt(cost=12)** 存储；从旧面板迁移来的 scrypt 账号、以及
+  1.1.4 之前的加盐 SHA-256 账号，**首次登录成功后会就地升级**（旧摘要只用于校验，不写新值）
+- **证书路径**：域名做主机名白名单校验（字母数字/点/横线/下划线），证书只能写进
+  `/etc/ssl/securev/<域名>/`，`../` 一类输入会被直接拒绝
+- **登录页素材**：解包/读取都走 `os.Root`，`..`、绝对路径、软链逃逸都会被拒绝；单文件/总量/文件数有上限
+- **Cookie**：面板 `sid` 为 `HttpOnly + SameSite=Strict`，HTTPS 下自动加 `Secure`；
+  登录页 `webvpnlogin` 也加了 `HttpOnly`
+- **部署建议**：面板 19999 只绑 `127.0.0.1`/内网，用 SSH 隧道或反代加 TLS；VPN 端口对公网开放时
+  记得同时放行 TCP 与 UDP（DTLS）
+- CodeQL 告警已逐条审计：路径注入/弱哈希/Cookie 均已修；仅保留「兼容旧摘要的 SHA-256 校验」
+  这一处（代码注释已说明，登录即升级到 bcrypt）
 
 ## 许可
 
