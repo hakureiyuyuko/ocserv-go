@@ -269,7 +269,11 @@ docker exec ocserv-go ocserv-go hash '新密码'   # 打印 bcrypt 哈希
 | `-ip` | `10.66.66.1` | 隧道内服务端地址（必须在池内） |
 | `-dns` | `1.1.1.1` | 下发给客户端的 DNS（逗号分隔，最多 2 个） |
 | `-mtu` | `1400` | 隧道 MTU |
-| `-dpd` | `30` | 保活间隔（秒），0 关闭 |
+| `-dpd` | `30` | 保活间隔：2×dpd 没收到包就发 DPD，3×dpd 没收到 TCP 包就断开；0 关闭检测 |
+| `-mobile-dpd` | `30` | 移动端 DPD 间隔（秒；0 = 用 `-dpd`） |
+| `-idle-timeout` | `0` | 多久没有用户数据就断开（秒；0 = 不限制） |
+| `-mobile-idle-timeout` | `0` | 移动端空闲断开阈值（秒；0 = 用 `-idle-timeout`） |
+| `-switch-to-tcp-timeout` | `25` | DTLS 静默多少秒后数据改走 TCP（0 = 不切换） |
 | `-socks` | — | 出网走 SOCKS5（TCP；UDP 直连） |
 | `-self-signed` | false | 无证书时生成自签 |
 | `-domain` | `ocserv-go.local` | 自签证书 CN / 下发默认域 |
@@ -345,6 +349,40 @@ X-DTLS12-CipherSuite: ECDHE-RSA-AES256-GCM-SHA384
 
 > **需要 RSA 证书**（Cisco 用 ECDHE-RSA 套件）。ECDSA 证书时自动禁用 DTLS 并打日志；
 > 面板在 `backend=go` 时会用 RSA（ACME 2048 / 自签 rsa:2048）。
+
+## 连接保活与死链检测（手机熄屏 / 换网恢复）
+
+手机熄屏、Wi-Fi 与蜂窝切换后，旧的 TCP 和 DTLS 都可能变成"黑洞"——内核不报错，客户端却
+以为还连着，表现就是**显示已连接、但没有流量**。这里的行为对齐原版 ocserv 的
+`periodic_check()`：
+
+- 每条隧道记录**最近一次收到 TCP 帧 / DTLS 包 / 用户数据**的时间
+- `2×dpd` 没收到包 → 主动发 DPD 探测；TCP 走 CSTP 帧，DTLS 按数据 MTU 填长度（兼做 PMTU 探测）
+- `3×dpd` 没收到 **TCP** 包 → 判定隧道死亡，断开并打日志
+- `3×dpd` 没收到 **UDP** 包 → 日志提示 DTLS 超时，**数据改走 TCP**；保留 DTLS 以便客户端
+  恢复后继续用（客户端重新握手也会被接上）
+- `-switch-to-tcp-timeout`（默认 25 秒）：DTLS 静默超过这个时间，数据就先走 TCP，不必等到
+  3×dpd；客户端再发 UDP 包会自动切回 DTLS
+- `-idle-timeout`：可选，超过这么久没有**用户数据**就断开（默认 0 = 不限，避免误踢挂机连接）
+- 移动端识别：`X-CSTP-Device-Platform: android/apple-ios` 或 `X-CSTP-License: mobile` 或 UA
+  里带 Android/iPhone/iPad，命中后用 `-mobile-dpd` / `-mobile-idle-timeout`
+- 下发的 `X-CSTP-DPD` / `X-DTLS-DPD` / `X-CSTP-Idle-Timeout` 都按实际配置生成
+
+默认值（`dpd=30`）下，客户端失联约 **90 秒**后服务端会断开并释放会话；原来是"只要内核
+keepalive 不杀（默认 2 小时）就一直挂着"。实测（`-dpd 3`）：静默客户端 9 秒断开；按 DPD
+回包的客户端活过 20 秒、停止回包后约 9 秒断开；`-dpd 0 -idle-timeout 5` 时 5 秒空闲断开。
+
+日志样例：
+
+```
+保活: 发 TCP DPD（用户=alice）               # -v 时才打
+DPD 超时：90 秒没收到 TCP 包（3×dpd=90 秒），断开隧道（用户=alice 客户端=10.66.66.2）
+DTLS 超时：90 秒没收到 UDP 包（3×dpd=90 秒），数据改走 TCP（保留 DTLS 等待恢复）（用户=alice …）
+空闲超时：1200 秒没有用户数据（阈值 1200 秒），断开隧道（用户=alice …）
+```
+
+> 服务端负责"尽快判定死链 + 回落到 TCP"；最终重新连接仍由客户端决定（AnyConnect 自己的
+> DTLS 回退/重连逻辑）。这套机制把"无感知的死连接"窗口从小时级压到 1～2 分钟。
 
 ## ICMP 应答（ping 延迟）
 
@@ -599,6 +637,8 @@ Configured as 10.66.66.2, with SSL connected and DTLS connected
   `v3` 包在本机（Haswell+）跑通完整协议
 - 真机协议探针：`init → auth-request`、`/auth → complete`（带 `&sh:`）、`CONNECT 200`、
   隧道内 ICMP echo 应答，每版发版前复测
+- 保活/死链：静默客户端 3×dpd 断开、回 DPD 的客户端不掉线、`-idle-timeout` 生效；
+  真 openconnect 9.12 建立 DTLS 后丢 UDP 12 秒，服务端按 3×dpd 提示 DTLS 超时、TCP 控制面不受影响
 
 ## 已知限制
 
@@ -608,7 +648,7 @@ Configured as 10.66.66.2, with SSL connected and DTLS connected
 - 路由固定全局，不下发 split include/exclude
 - ICMP 由服务端本地代答（ping 任意地址都回，延迟=到网关 RTT；`-icmp-echo=false` 关闭）
 - 出网源地址是运行本进程的机器（上游看到宿主 IP）
-- 认证状态按连接维护，没有会话超时/重新认证策略
+- 认证状态按连接维护，没有 `session-timeout`（到期强制重新认证）；可用 `-idle-timeout` 回收无流量会话
 - 无带宽限制、无多用户审计
 - DTLS 需要 RSA 证书
 

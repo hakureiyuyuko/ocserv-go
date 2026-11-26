@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -54,7 +55,11 @@ var (
 	clientNet   = flag.String("net", "10.66.66.0/24", "客户端地址池网段")
 	dnsStr      = flag.String("dns", "1.1.1.1", "下发给客户端的 DNS（逗号分隔，最多 2 个）")
 	mtu         = flag.Int("mtu", 1400, "隧道 MTU")
-	dpd         = flag.Int("dpd", 30, "保活间隔（秒）")
+	dpd         = flag.Int("dpd", 30, "保活间隔（秒）：2×dpd 没收到包就发 DPD，3×dpd 没收到 TCP 包就断开")
+	mobileDPD   = flag.Int("mobile-dpd", 30, "移动端 DPD 间隔（秒；0 = 同 -dpd）")
+	idleTimeout = flag.Int("idle-timeout", 0, "无用户数据多久断开（秒；0 = 不限制）")
+	mobileIdle  = flag.Int("mobile-idle-timeout", 0, "移动端无数据多久断开（秒；0 = 用 -idle-timeout）")
+	switchTCP   = flag.Int("switch-to-tcp-timeout", 25, "DTLS 静默多少秒后数据改走 TCP（0 = 不切换）")
 	socksAddr   = flag.String("socks", "", "出网走 SOCKS5（host:port，可选；UDP 仍直连）")
 	selfSigned  = flag.Bool("self-signed", false, "没有证书时自动生成自签证书（联调用）")
 	domain      = flag.String("domain", "ocserv-go.local", "自签证书/默认域使用的域名")
@@ -100,24 +105,28 @@ func withSession(ctx context.Context, c net.Conn) context.Context {
 }
 
 type server struct {
-	users     *auth.Users
-	certStore *certStore
-	connLog   *connlog.Log
-	assetsDir string
-	icmpEcho  bool
-	pendMu    sync.Mutex
-	pend      map[string]pendEntry
-	pool      *ippool.Pool
-	dials     usrnet.DialFunc
-	mtu       int
-	dpd       time.Duration
-	dns       []string
-	prefix    int
-	serverIP  net.IP
-	domain    string
-	style     string
-	secure    bool // 是否 TLS（决定 cookie 是否带 Secure）
-	start     time.Time
+	users      *auth.Users
+	certStore  *certStore
+	connLog    *connlog.Log
+	assetsDir  string
+	icmpEcho   bool
+	pendMu     sync.Mutex
+	pend       map[string]pendEntry
+	pool       *ippool.Pool
+	dials      usrnet.DialFunc
+	mtu        int
+	dpd        time.Duration
+	mobileDPD  time.Duration
+	idle       time.Duration
+	mobileIdle time.Duration
+	switchTCP  time.Duration
+	dns        []string
+	prefix     int
+	serverIP   net.IP
+	domain     string
+	style      string
+	secure     bool // 是否 TLS（决定 cookie 是否带 Secure）
+	start      time.Time
 
 	tokensMu sync.Mutex
 	tokens   map[string]string // webvpn cookie → 用户名
@@ -137,22 +146,26 @@ type tunnel struct {
 
 // serverConfig 是 newServer 的入参（便于测试直接构造）。
 type serverConfig struct {
-	Users     *auth.Users
-	ClientNet string
-	ServerIP  string
-	MTU       int
-	DPD       int
-	DNS       []string
-	Domain    string
-	Style     string
-	Addr      string
-	DTLS      bool
-	DTLSPort  int
-	CertStore *certStore
-	ConnLog   *connlog.Log
-	AssetsDir string
-	ICMPEcho  bool
-	Dial      usrnet.DialFunc
+	Users             *auth.Users
+	ClientNet         string
+	ServerIP          string
+	MTU               int
+	DPD               int
+	MobileDPD         int
+	IdleTimeout       int
+	MobileIdleTimeout int
+	SwitchToTCP       int
+	DNS               []string
+	Domain            string
+	Style             string
+	Addr              string
+	DTLS              bool
+	DTLSPort          int
+	CertStore         *certStore
+	ConnLog           *connlog.Log
+	AssetsDir         string
+	ICMPEcho          bool
+	Dial              usrnet.DialFunc
 }
 
 func newServer(c serverConfig) (*server, error) {
@@ -166,24 +179,28 @@ func newServer(c serverConfig) (*server, error) {
 		c.MTU = 1400
 	}
 	s := &server{
-		users:     c.Users,
-		pool:      pool,
-		mtu:       c.MTU,
-		dpd:       time.Duration(c.DPD) * time.Second,
-		dns:       c.DNS,
-		prefix:    ones,
-		certStore: c.CertStore,
-		connLog:   c.ConnLog,
-		assetsDir: c.AssetsDir,
-		icmpEcho:  c.ICMPEcho,
-		serverIP:  net.ParseIP(c.ServerIP),
-		domain:    c.Domain,
-		style:     c.Style,
-		start:     time.Now(),
-		tokens:    make(map[string]string),
-		tunnels:   make(map[string]*tunnel),
-		dtlsWant:  c.DTLS,
-		dtlsPort:  c.DTLSPort,
+		users:      c.Users,
+		pool:       pool,
+		mtu:        c.MTU,
+		dpd:        time.Duration(c.DPD) * time.Second,
+		mobileDPD:  time.Duration(c.MobileDPD) * time.Second,
+		idle:       time.Duration(c.IdleTimeout) * time.Second,
+		mobileIdle: time.Duration(c.MobileIdleTimeout) * time.Second,
+		switchTCP:  time.Duration(c.SwitchToTCP) * time.Second,
+		dns:        c.DNS,
+		prefix:     ones,
+		certStore:  c.CertStore,
+		connLog:    c.ConnLog,
+		assetsDir:  c.AssetsDir,
+		icmpEcho:   c.ICMPEcho,
+		serverIP:   net.ParseIP(c.ServerIP),
+		domain:     c.Domain,
+		style:      c.Style,
+		start:      time.Now(),
+		tokens:     make(map[string]string),
+		tunnels:    make(map[string]*tunnel),
+		dtlsWant:   c.DTLS,
+		dtlsPort:   c.DTLSPort,
 	}
 	if s.dtlsPort == 0 {
 		if _, ps, err := net.SplitHostPort(c.Addr); err == nil {
@@ -256,22 +273,26 @@ func main() {
 	}
 
 	s, err := newServer(serverConfig{
-		Users:     users,
-		ClientNet: *clientNet,
-		ServerIP:  *serverIP,
-		MTU:       *mtu,
-		DPD:       *dpd,
-		DNS:       splitCSV(*dnsStr),
-		Domain:    *domain,
-		Style:     *style,
-		Addr:      *addr,
-		DTLS:      *dtlsOn && !*httpOnly,
-		DTLSPort:  *dtlsPort,
-		CertStore: store,
-		ConnLog:   connlog.Open(*connLogPath),
-		AssetsDir: *assetsDir,
-		ICMPEcho:  *icmpEcho,
-		Dial:      buildDialer(*socksAddr),
+		Users:             users,
+		ClientNet:         *clientNet,
+		ServerIP:          *serverIP,
+		MTU:               *mtu,
+		DPD:               *dpd,
+		MobileDPD:         *mobileDPD,
+		IdleTimeout:       *idleTimeout,
+		MobileIdleTimeout: *mobileIdle,
+		SwitchToTCP:       *switchTCP,
+		DNS:               splitCSV(*dnsStr),
+		Domain:            *domain,
+		Style:             *style,
+		Addr:              *addr,
+		DTLS:              *dtlsOn && !*httpOnly,
+		DTLSPort:          *dtlsPort,
+		CertStore:         store,
+		ConnLog:           connlog.Open(*connLogPath),
+		AssetsDir:         *assetsDir,
+		ICMPEcho:          *icmpEcho,
+		Dial:              buildDialer(*socksAddr),
 	})
 	if err != nil {
 		log.Fatalf("启动配置错误: %v", err)
@@ -1018,6 +1039,28 @@ func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		dataMTU = maxData
 	}
 
+	// 保活参数：移动端可以单独配 mobile-dpd / mobile-idle-timeout
+	lc := liveCfg{dpd: s.dpd, idle: s.idle, switchTCP: s.switchTCP}
+	if isMobileRequest(r) {
+		if s.mobileDPD > 0 {
+			lc.dpd = s.mobileDPD
+		}
+		if s.mobileIdle > 0 {
+			lc.idle = s.mobileIdle
+		}
+	}
+
+	// 兜底：把底层 TCP 的 keepalive 调短（内核默认 7200 秒，死链要挂两小时）
+	if nc, ok := conn.(interface{ NetConn() net.Conn }); ok {
+		if tc, ok := nc.NetConn().(*net.TCPConn); ok {
+			_ = tc.SetKeepAlive(true)
+			_ = tc.SetKeepAlivePeriod(120 * time.Second)
+		}
+	} else if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(120 * time.Second)
+	}
+
 	// 建隧道：直接回裸 HTTP 响应，之后是 CSTP 二进制流。
 	// 字段与取值逐项照「能用的」那台 ocserv（dpd=90 / keepalive=32400 /
 	// rekey-time=172800+ssl / mtu=1420 / 无 session-timeout 即 none）：
@@ -1026,7 +1069,9 @@ func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(conn, "HTTP/1.1 200 CONNECTED\r\n")
 	fmt.Fprintf(conn, "X-CSTP-Version: 1\r\n")
 	fmt.Fprintf(conn, "X-CSTP-Server-Name: OpenConnect VPN Server\r\n")
-	fmt.Fprintf(conn, "X-CSTP-DPD: 90\r\n")
+	if lc.dpd > 0 {
+		fmt.Fprintf(conn, "X-CSTP-DPD: %d\r\n", int(lc.dpd.Seconds()))
+	}
 	fmt.Fprintf(conn, "X-CSTP-Address: %s\r\n", ip.String())
 	fmt.Fprintf(conn, "X-CSTP-Netmask: %s\r\n", s.netmask())
 	for i, d := range s.dns {
@@ -1038,7 +1083,11 @@ func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(conn, "X-CSTP-Tunnel-All-DNS: true\r\n")
 	fmt.Fprintf(conn, "X-CSTP-Client-Bypass-Protocol: false\r\n")
 	fmt.Fprintf(conn, "X-CSTP-Keepalive: 32400\r\n")
-	fmt.Fprintf(conn, "X-CSTP-Idle-Timeout: none\r\n")
+	if lc.idle > 0 {
+		fmt.Fprintf(conn, "X-CSTP-Idle-Timeout: %d\r\n", int(lc.idle.Seconds()))
+	} else {
+		fmt.Fprintf(conn, "X-CSTP-Idle-Timeout: none\r\n")
+	}
 	fmt.Fprintf(conn, "X-CSTP-Smartcard-Removal-Disconnect: true\r\n")
 	fmt.Fprintf(conn, "X-CSTP-Rekey-Time: 172800\r\n")
 	fmt.Fprintf(conn, "X-CSTP-Rekey-Method: ssl\r\n")
@@ -1051,7 +1100,9 @@ func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(conn, "X-DTLS-Session-ID: %s\r\n", tun.id)
 		fmt.Fprintf(conn, "X-DTLS-Port: %d\r\n", s.dtlsPort)
 		fmt.Fprintf(conn, "X-DTLS-12: 1\r\n")
-		fmt.Fprintf(conn, "X-DTLS-DPD: 90\r\n")
+		if lc.dpd > 0 {
+			fmt.Fprintf(conn, "X-DTLS-DPD: %d\r\n", int(lc.dpd.Seconds()))
+		}
 		fmt.Fprintf(conn, "X-DTLS-MTU: %d\r\n", dataMTU)
 		fmt.Fprintf(conn, "X-DTLS12-CipherSuite: %s\r\n", dtlsx.SuiteNameRSA)
 	}
@@ -1069,10 +1120,27 @@ func (s *server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	defer log.Printf("隧道断开: 用户=%s 客户端 IP=%s", user, ip)
 
-	s.tunnel(r.Context(), conn, brw.Reader, user, ip, tun)
+	s.tunnel(r.Context(), conn, brw.Reader, user, ip, tun, dataMTU, lc)
 }
 
 func (s *server) dtlsEnabled() bool { return s.dtlsWant }
+
+// isMobileRequest 判断是不是移动端：
+// ocserv 看 X-CSTP-Device-Platform（android / apple-ios），AnyConnect 移动版还会发
+// X-CSTP-License: mobile，UA 里也带 Android/iPhone/iPad。
+func isMobileRequest(r *http.Request) bool {
+	if p := strings.ToLower(r.Header.Get("X-CSTP-Device-Platform")); p != "" {
+		if strings.Contains(p, "android") || strings.Contains(p, "ios") {
+			return true
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("X-CSTP-License")), "mobile") {
+		return true
+	}
+	ua := strings.ToLower(r.Header.Get("User-Agent"))
+	return strings.Contains(ua, "android") || strings.Contains(ua, "iphone") ||
+		strings.Contains(ua, "ipad") || strings.Contains(ua, "ios")
+}
 
 // certIsRSA 判断证书公钥是不是 RSA（Cisco 风格 DTLS 用 ECDHE-RSA 套件）。
 func certIsRSA(c tls.Certificate) bool {
@@ -1132,7 +1200,7 @@ type frame struct {
 	viaDTLS bool // 是否强制走 DTLS（DPD 需在同一传输上回）
 }
 
-func (s *server) tunnel(ctx context.Context, conn net.Conn, br *bufio.Reader, user string, ip net.IP, tun *tunnel) {
+func (s *server) tunnel(ctx context.Context, conn net.Conn, br *bufio.Reader, user string, ip net.IP, tun *tunnel, dataMTU int, lc liveCfg) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -1157,6 +1225,14 @@ func (s *server) tunnel(ctx context.Context, conn net.Conn, br *bufio.Reader, us
 	}
 	in := make(chan inFrame, 256)
 
+	// 保活/死链检测用的时间戳（UnixNano，0 表示还没发生）
+	nowNs := func() int64 { return time.Now().UnixNano() }
+	var lastTCP, lastUDP, lastData, probeTCP, probeUDP atomic.Int64
+	lastTCP.Store(nowNs())
+	lastUDP.Store(nowNs())
+	lastData.Store(nowNs())
+	var dtlsWarned atomic.Bool
+
 	// TCP 控制通道
 	go func() {
 		for {
@@ -1168,6 +1244,7 @@ func (s *server) tunnel(ctx context.Context, conn net.Conn, br *bufio.Reader, us
 				cancel()
 				return
 			}
+			lastTCP.Store(nowNs())
 			select {
 			case in <- inFrame{typ, payload, false}:
 			case <-ctx.Done():
@@ -1176,24 +1253,54 @@ func (s *server) tunnel(ctx context.Context, conn net.Conn, br *bufio.Reader, us
 		}
 	}()
 
-	// DTLS 数据面：等待客户端连上来，然后并行读帧
+	// DTLS 数据面：一个隧道可能经历多次 DTLS 握手（换网/熄屏恢复后客户端会重新握手）。
+	// 这里循环等待新的 DTLS 连接，出错只回落到 TCP，不退出整个隧道。
 	var dtlsMu sync.Mutex
 	var dtlsConn net.Conn
+	defer func() {
+		dtlsMu.Lock()
+		if dtlsConn != nil {
+			_ = dtlsConn.Close()
+			dtlsConn = nil
+		}
+		dtlsMu.Unlock()
+	}()
 	if tun != nil {
 		go func() {
-			select {
-			case c := <-tun.dtlsCh:
+			dbuf := make([]byte, 65536)
+			for {
+				var c net.Conn
+				select {
+				case c = <-tun.dtlsCh:
+				case <-ctx.Done():
+					return
+				}
 				dtlsMu.Lock()
 				dtlsConn = c
 				dtlsMu.Unlock()
+				lastUDP.Store(nowNs())
+				dtlsWarned.Store(false)
 				log.Printf("DTLS 数据面已建立: 用户=%s 客户端=%s", user, ip)
-				// DTLS 是数据报：格式为 [1 字节类型][负载]，不是 8 字节 CSTP 头
-				dbuf := make([]byte, 65536)
+
 				for {
 					n, rerr := c.Read(dbuf)
+					if rerr != nil {
+						dtlsMu.Lock()
+						if dtlsConn == c {
+							dtlsConn = nil
+						}
+						dtlsMu.Unlock()
+						_ = c.Close()
+						log.Printf("DTLS 连接结束（回落到 TCP）: %v", rerr)
+						break // 等下一次 DTLS 握手
+					}
+					if n > 0 {
+						lastUDP.Store(nowNs())
+						dtlsWarned.Store(false)
+					}
 					var typ cstp.Type
 					var payload []byte
-					if rerr == nil && n > 0 {
+					if n > 0 {
 						if t, pl, perr := cstp.ParseDTLS(dbuf[:n]); perr == nil {
 							typ, payload = t, append([]byte(nil), pl...)
 						}
@@ -1201,24 +1308,18 @@ func (s *server) tunnel(ctx context.Context, conn net.Conn, br *bufio.Reader, us
 							log.Printf("DTLS 收到: 类型=%d 长度=%d", typ, n-1)
 						}
 					}
-					err := rerr
-					if err != nil {
-						dtlsMu.Lock()
-						if dtlsConn == c {
-							dtlsConn = nil
-						}
-						dtlsMu.Unlock()
-						_ = c.Close()
-						log.Printf("DTLS 连接结束（回落到 TCP）: %v", err)
-						return
-					}
 					select {
 					case in <- inFrame{typ, payload, true}:
 					case <-ctx.Done():
+						_ = c.Close()
 						return
 					}
 				}
-			case <-ctx.Done():
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
 			}
 		}()
 	}
@@ -1227,14 +1328,18 @@ func (s *server) tunnel(ctx context.Context, conn net.Conn, br *bufio.Reader, us
 	writes := make(chan frame, 512)
 	go func() {
 		for f := range writes {
+			now := time.Now()
 			target := conn
 			wantDTLS := f.viaDTLS || f.typ == cstp.TypeData
 			if wantDTLS {
 				dtlsMu.Lock()
-				if dtlsConn != nil {
-					target = dtlsConn
-				}
+				dc := dtlsConn
 				dtlsMu.Unlock()
+				// 数据帧：DTLS 静默太久就先走 TCP（等价 ocserv 的 switch-to-tcp-timeout）；
+				// 客户端再发 UDP 包时 lastUDP 更新，会自动切回 DTLS。
+				if dc != nil && (f.viaDTLS || dtlsEgressOK(now, time.Unix(0, lastUDP.Load()), lc)) {
+					target = dc
+				}
 			}
 			if *verbose {
 				log.Printf("CSTP 发送: 类型=%s(%d) 长度=%d viaDTLS=%v", f.typ, int(f.typ), len(f.payload), target != conn)
@@ -1277,23 +1382,66 @@ func (s *server) tunnel(ctx context.Context, conn net.Conn, br *bufio.Reader, us
 		}
 	}()
 
-	// 保活：定期发 DPD 请求（走 TCP 控制通道）
+	// 保活 / 死链检测：每秒检查一次（语义见 liveness.go 与 ocserv 的 periodic_check）
 	go func() {
-		if s.dpd <= 0 {
+		if lc.dpd <= 0 && lc.idle <= 0 {
 			return
 		}
-		t := time.NewTicker(s.dpd)
+		t := time.NewTicker(time.Second)
 		defer t.Stop()
 		for {
 			select {
-			case <-t.C:
-				select {
-				case writes <- frame{cstp.TypeDPDReq, nil, false}:
-				case <-ctx.Done():
-					return
-				}
 			case <-ctx.Done():
 				return
+			case now := <-t.C:
+				dtlsMu.Lock()
+				dc := dtlsConn
+				dtlsMu.Unlock()
+
+				d := decideLiveness(now, liveClock{
+					tcp:      time.Unix(0, lastTCP.Load()),
+					udp:      time.Unix(0, lastUDP.Load()),
+					data:     time.Unix(0, lastData.Load()),
+					probeTCP: time.Unix(0, probeTCP.Load()),
+					probeUDP: time.Unix(0, probeUDP.Load()),
+				}, dc != nil, lc)
+
+				if d.SendDPDTCP {
+					probeTCP.Store(now.UnixNano())
+					select {
+					case writes <- frame{cstp.TypeDPDReq, nil, false}:
+					case <-ctx.Done():
+						return
+					}
+					if *verbose {
+						log.Printf("保活: 发 TCP DPD（用户=%s）", user)
+					}
+				}
+				if d.SendDPDUDP {
+					probeUDP.Store(now.UnixNano())
+					n := dataMTU - 1 // DTLS 上是 [1 字节类型][负载]，总长 ≈ 数据 MTU，兼做 PMTU 探测
+					if n < 1 {
+						n = 1200
+					}
+					select {
+					case writes <- frame{cstp.TypeDPDReq, make([]byte, n), true}:
+					case <-ctx.Done():
+						return
+					}
+					if *verbose {
+						log.Printf("保活: 发 DTLS DPD %d 字节（用户=%s）", n+1, user)
+					}
+				}
+				if d.DropDTLS != "" && !dtlsWarned.Swap(true) {
+					// 不立刻关 DTLS：保留 socket，客户端再发 UDP 包就能恢复；
+					// 数据出口已经在静默超过 switch-to-tcp-timeout 后改走 TCP。
+					log.Printf("%s（用户=%s 客户端=%s）", d.DropDTLS, user, ip)
+				}
+				if d.DropTunnel != "" {
+					log.Printf("%s（用户=%s 客户端=%s）", d.DropTunnel, user, ip)
+					cancel()
+					return
+				}
 			}
 		}
 	}()
@@ -1306,6 +1454,7 @@ func (s *server) tunnel(ctx context.Context, conn net.Conn, br *bufio.Reader, us
 			}
 			switch f.typ {
 			case cstp.TypeData:
+				lastData.Store(nowNs())
 				if err := st.Inject(f.payload); err != nil && *verbose {
 					log.Printf("注入失败: %v", err)
 				}
